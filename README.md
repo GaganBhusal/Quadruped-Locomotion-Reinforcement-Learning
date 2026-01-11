@@ -1,5 +1,6 @@
-#Genesis
+# Genesis
 
-<video src="Media/push_up.mp4" width="1280" height="720" controls>
-    No video haha!!!!!
-</video>
+<hr>
+
+[▶️ Watch Demo Video](https://github.com/GaganBhusal/GenesisTest/blob/main/Media/push_up.mp4)
+
