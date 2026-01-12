@@ -4,14 +4,14 @@ import numpy as np
 import gymnasium as gym
 from scipy.spatial.transform import Rotation
 
-gs.init(backend=gs.cpu, logging_level = "warning")
 
 class StandENV(gym.Env):
 
-    def __init__(self):
+    def __init__(self, render = False, backend = gs.cpu):
         super().__init__()
-        
-        self.scene = gs.Scene(show_viewer=True)
+
+        gs.init(backend=backend, logging_level = "warning")
+        self.scene = gs.Scene(show_viewer=render)
 
         plane = self.scene.add_entity(gs.morphs.Plane())
         self.robot = self.scene.add_entity(
@@ -119,7 +119,7 @@ class StandENV(gym.Env):
                 # print(f"Joint Name : {joint.name}, DOF : {joint.n_dofs}, type : {type(joint)}, Axis : {torch.rad2deg(torch.tensor(joint.dofs_limit))}")
         # print(f"Ranges : {self.joints_limit_low}\n{self.joints_limit_high}")
 
-    def reset(self):
+    def reset(self, *, seed=None, options=None):
 
         super().reset()
         self.robot.control_dofs_position(
@@ -147,7 +147,7 @@ class StandENV(gym.Env):
         self.scene.step()
         return observation, reward, terminated, truncated, info
     
-
-env = StandENV()
-print(env.reset())
-print(env.step(action=[0.5] * 12))
+if __name__ == "__main__":
+    env = StandENV()
+    print(env.reset())
+    print(env.step(action=[0.5] * 12))
