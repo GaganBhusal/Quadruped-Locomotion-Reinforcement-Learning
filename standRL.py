@@ -2,6 +2,7 @@ import genesis as gs
 import torch
 import numpy as np
 import gymnasium as gym
+from scipy.spatial.transform import Rotation
 
 gs.init(backend=gs.cpu, logging_level = "warning")
 
@@ -29,53 +30,77 @@ class StandENV(gym.Env):
         self._get_internal_info()
         self.scene.build()
 
-        imu_values_range_low = [-torch.pi/4] * 3
-        imu_values_range_high = [torch.pi/4] * 3
+        obs_space_low = np.concatenate([
+            -np.ones(12),
+            -np.ones(12),
+            [-1] * 4
+        ])
 
-        obs_space_low = self.joints_limit_low + imu_values_range_low
-        obs_space_high = self.joints_limit_low + imu_values_range_high
+        obs_space_high = np.concatenate([
+            np.ones(12),
+            np.ones(12),
+            [1] * 4
+        ])
 
         self.observation_space = gym.spaces.Box(
-            low=np.array(obs_space_low),
-            high=np.array(obs_space_high),
-            shape=(15, ),
+            low=obs_space_low,
+            high=obs_space_high,
             dtype=float
         )
 
         self.action_space = gym.spaces.Box(
-            low=np.ones_like(self.joints_limit_low) * -1,
-            high=np.ones_like(self.joints_limit_high),
+            low=-1,
+            high=1,
             shape=(12, ),
             dtype=float
         )
 
+        self.initial_positions = self.robot.get_dofs_position(dofs_idx_local = self.joints_local_idx).numpy()
+
     def _get_imu_values(self):
-        _linear_acc, _angular_acc = self.imu.read()
-        return _linear_acc, _angular_acc
+        _linear_acc, _angular_vel = self.imu.read()
+        return _linear_acc, _angular_vel
+
+    def _get_ypr(self):
+        quat_wxyz = self.robot.get_link("base").get_quat()
+        quat_xyzw = [quat_wxyz[1], quat_wxyz[2], quat_wxyz[3], quat_wxyz[0]]
+        rotation = Rotation.from_quat(quat_xyzw)
+        euler_angles = rotation.as_euler("xyz")
+        return euler_angles
 
     def _calculate_reward(self):
          
         terminated = False
-        self.robot.control_dofs_position(
-            self.new_joint_angles, 
-            dofs_idx_local = self.joints_local_idx
-        )
 
         z_coordinate_base = self.robot.get_link("base").get_pos()[2]
         angular_velocity_joints = self.robot.get_dofs_velocity(dofs_idx_local = self.joints_local_idx[1:])
+        wx, wy, wz = self._get_imu_values()[1]
+        roll, yaw, pitch = self._get_ypr()
 
-        reward = z_coordinate_base * 0.5 - abs(torch.sum(angular_velocity_joints**2))
-        
-        roll, yaw, pitch = self._get_imu_values()[1]
-        if roll > 1 or pitch > 1:
+        reward = (
+            z_coordinate_base -
+            (wx**2 + wy**2) -
+            (roll**2 + pitch*2)
+        ) 
+
+        if abs(roll) > 0.4 or abs(pitch) > 0.4:
+            reward -= 30
             terminated = True
 
-        return reward.item(),  terminated
+        return reward.item(), terminated
 
     
     def _get_obs(self):
-        print(self.robot.get_dofs_position(dofs_idx_local = self.joints_local_idx[1:]).numpy())
-        return self.robot.get_dofs_position(dofs_idx_local = self.joints_local_idx).tolist() + self._get_imu_values()[1].tolist()
+        # print(self.robot.get_dofs_position(dofs_idx_local = self.joints_local_idx[1:]).numpy())
+
+        wx, wy, wz = self._get_imu_values()[1]
+        roll, yaw, pitch = self._get_ypr()
+
+        return np.concatenate([
+            self.robot.get_dofs_position(dofs_idx_local = self.joints_local_idx).tolist(),
+            self.robot.get_dofs_velocity(dofs_idx_local = self.joints_local_idx).tolist(),
+            [wx, wy, roll, pitch],
+        ])
 
 
     def _get_internal_info(self):
@@ -96,18 +121,31 @@ class StandENV(gym.Env):
 
     def reset(self):
 
-        super().__init__()
+        super().reset()
+        self.robot.control_dofs_position(
+            self.initial_positions, 
+            dofs_idx_local = self.joints_local_idx
+        )
         observation = self._get_obs()
-        info = 2
+        info = {}
+        self.scene.step()
         return observation, info
         
     def step(self, action):
         self.new_joint_angles = np.add(self.robot.get_dofs_position(dofs_idx_local = self.joints_local_idx), action)
 
+        self.robot.control_dofs_position(
+            self.new_joint_angles, 
+            dofs_idx_local = self.joints_local_idx
+        )
+
         reward, terminated = self._calculate_reward()
         observation = self._get_obs()
+        truncated = False
+        info = {}
 
-        return observation, reward, terminated, True, 1
+        self.scene.step()
+        return observation, reward, terminated, truncated, info
     
 
 env = StandENV()
