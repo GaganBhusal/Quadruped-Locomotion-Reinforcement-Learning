@@ -1,43 +1,26 @@
 import genesis as gs
 import torch
-from sliders_for_joints import JointControllerApp
 import numpy as np
 import gymnasium as gym
 
-
-
 gs.init(backend=gs.cpu, logging_level = "warning")
-
-scene = gs.Scene(show_viewer=True)
-print(scene)
-
-plane = scene.add_entity(gs.morphs.Plane())
-go = scene.add_entity(
-    gs.morphs.URDF(file='/home/yayy/My/Codeeeeee/Simulators/Genesis/genesis/assets/urdf/go2/urdf/go2.urdf'),
-)
-print(go.idx)
-imu = scene.add_sensor(
-    gs.sensors.IMU(
-        entity_idx = go.idx,
-        link_idx_local = go.get_link("base").idx_local,
-        interpolate = True,
-        draw_debug = True
-    )
-)
-
 
 class StandENV(gym.Env):
 
-    def __init__(self, robot, scene):
+    def __init__(self):
         super().__init__()
         
-        self.scene = scene
-        self.robot = robot
+        self.scene = gs.Scene(show_viewer=True)
 
-        self.imu = scene.add_sensor(
+        plane = self.scene.add_entity(gs.morphs.Plane())
+        self.robot = self.scene.add_entity(
+            gs.morphs.URDF(file='/home/yayy/My/Codeeeeee/Simulators/Genesis/genesis/assets/urdf/go2/urdf/go2.urdf'),
+        )
+
+        self.imu = self.scene.add_sensor(
             gs.sensors.IMU(
-                entity_idx = go.idx,
-                link_idx_local = go.get_link("base").idx_local,
+                entity_idx = self.robot.idx,
+                link_idx_local = self.robot.get_link("base").idx_local,
                 interpolate = True,
                 draw_debug = True
             )
@@ -51,7 +34,6 @@ class StandENV(gym.Env):
 
         obs_space_low = self.joints_limit_low + imu_values_range_low
         obs_space_high = self.joints_limit_low + imu_values_range_high
-        print(obs_space_high)
 
         self.observation_space = gym.spaces.Box(
             low=np.array(obs_space_low),
@@ -69,7 +51,6 @@ class StandENV(gym.Env):
 
     def _get_imu_values(self):
         _linear_acc, _angular_acc = self.imu.read()
-        print(_angular_acc)
         return _linear_acc, _angular_acc
 
     def _calculate_reward(self):
@@ -129,6 +110,6 @@ class StandENV(gym.Env):
         return observation, reward, terminated, True, 1
     
 
-env = StandENV(go, scene)
+env = StandENV()
 print(env.reset())
 print(env.step(action=[0.5] * 12))
