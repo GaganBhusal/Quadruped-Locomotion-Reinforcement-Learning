@@ -10,6 +10,9 @@ class StandENV(gym.Env):
     def __init__(self, render = False, backend = gs.cpu):
         super().__init__()
 
+        self.timestep_low_z_value = 0
+        self.timestep = 0
+
         gs.init(backend=backend, logging_level = "warning")
         self.scene = gs.Scene(show_viewer=render)
 
@@ -43,8 +46,9 @@ class StandENV(gym.Env):
         ])
 
         self.observation_space = gym.spaces.Box(
-            low=obs_space_low,
-            high=obs_space_high,
+            low=-np.inf,
+            high=-np.inf,
+            shape=(28, ),
             dtype=float
         )
 
@@ -55,53 +59,11 @@ class StandENV(gym.Env):
             dtype=float
         )
 
-        self.initial_positions = self.robot.get_dofs_position(dofs_idx_local = self.joints_local_idx).numpy()
-
-    def _get_imu_values(self):
-        _linear_acc, _angular_vel = self.imu.read()
-        return _linear_acc, _angular_vel
-
-    def _get_ypr(self):
-        quat_wxyz = self.robot.get_link("base").get_quat()
-        quat_xyzw = [quat_wxyz[1], quat_wxyz[2], quat_wxyz[3], quat_wxyz[0]]
-        rotation = Rotation.from_quat(quat_xyzw)
-        euler_angles = rotation.as_euler("xyz")
-        return euler_angles
-
-    def _calculate_reward(self):
-         
-        terminated = False
-
-        z_coordinate_base = self.robot.get_link("base").get_pos()[2]
-        angular_velocity_joints = self.robot.get_dofs_velocity(dofs_idx_local = self.joints_local_idx[1:])
-        wx, wy, wz = self._get_imu_values()[1]
-        roll, yaw, pitch = self._get_ypr()
-
-        reward = (
-            z_coordinate_base -
-            (wx**2 + wy**2) -
-            (roll**2 + pitch*2)
-        ) 
-
-        if abs(roll) > 0.4 or abs(pitch) > 0.4:
-            reward -= 30
-            terminated = True
-
-        return reward.item(), terminated
-
-    
-    def _get_obs(self):
-        # print(self.robot.get_dofs_position(dofs_idx_local = self.joints_local_idx[1:]).numpy())
-
-        wx, wy, wz = self._get_imu_values()[1]
-        roll, yaw, pitch = self._get_ypr()
-
-        return np.concatenate([
-            self.robot.get_dofs_position(dofs_idx_local = self.joints_local_idx).tolist(),
-            self.robot.get_dofs_velocity(dofs_idx_local = self.joints_local_idx).tolist(),
-            [wx, wy, roll, pitch],
-        ])
-
+        self.__initial_positions = np.deg2rad(
+            np.array([
+                0, 0, 0, 0, 45, 45, 45, 45, -120, -120, -100, -100
+            ])
+        )
 
     def _get_internal_info(self):
         self.joints_local_idx = []
@@ -119,35 +81,96 @@ class StandENV(gym.Env):
                 # print(f"Joint Name : {joint.name}, DOF : {joint.n_dofs}, type : {type(joint)}, Axis : {torch.rad2deg(torch.tensor(joint.dofs_limit))}")
         # print(f"Ranges : {self.joints_limit_low}\n{self.joints_limit_high}")
 
+    def _get_imu_values(self):
+        _linear_acc, _angular_vel = self.imu.read()
+        return _linear_acc, _angular_vel
+
+    def _get_ypr(self):
+        quat_wxyz = self.robot.get_link("base").get_quat()
+        quat_xyzw = [quat_wxyz[1], quat_wxyz[2], quat_wxyz[3], quat_wxyz[0]]
+        rotation = Rotation.from_quat(quat_xyzw)
+        euler_angles = rotation.as_euler("xyz")
+        return euler_angles
+
+    def _calculate_reward(self):
+         
+        terminated = False
+        truncated = False
+
+        z_coordinate_base = self.robot.get_link("base").get_pos()[2]
+        angular_velocity_joints = self.robot.get_dofs_velocity(dofs_idx_local = self.joints_local_idx[1:])
+        # print(f"Angular Velocity Joints : {angular_velocity_joints ** 2}")
+        wx, wy, wz = self._get_imu_values()[1]
+        roll, yaw, pitch = self._get_ypr()
+
+        reward = (
+            z_coordinate_base * 0.5 -
+            (wx**2 + wy**2) -
+            (roll**2 + pitch*2) - 
+            torch.sum(angular_velocity_joints ** 2)
+        )
+
+        if z_coordinate_base < 0.16:
+            self.timestep_low_z_value += 1
+
+        if abs(roll) > 1 or abs(pitch) > 1:
+            reward -= 30
+            terminated = True
+
+        if self.timestep_low_z_value >= 1000:
+            reward -= 20
+            truncated = True
+
+        if self.timestep > 5000:
+            truncated = True
+
+        return reward.item(), terminated, truncated
+
+    
+    def _get_obs(self):
+        # print(self.robot.get_dofs_position(dofs_idx_local = self.joints_local_idx[1:]).numpy())
+
+        wx, wy, wz = self._get_imu_values()[1]
+        roll, yaw, pitch = self._get_ypr()
+
+        return np.concatenate([
+            self.robot.get_dofs_position(dofs_idx_local = self.joints_local_idx).tolist(),
+            self.robot.get_dofs_velocity(dofs_idx_local = self.joints_local_idx).tolist(),
+            [wx, wy, roll, pitch],
+        ])
+
     def reset(self, *, seed=None, options=None):
 
         super().reset()
-        self.robot.control_dofs_position(
-            self.initial_positions, 
+        self.scene.reset()
+        self.robot.set_dofs_position(
+            self.__initial_positions, 
             dofs_idx_local = self.joints_local_idx
         )
         observation = self._get_obs()
         info = {}
+        self.timestep = 0
+        self.timestep_low_z_value = 0
         self.scene.step()
         return observation, info
         
     def step(self, action):
-        self.new_joint_angles = np.add(self.robot.get_dofs_position(dofs_idx_local = self.joints_local_idx), action)
+        self.new_joint_angles = np.add(self.robot.get_dofs_position(dofs_idx_local = self.joints_local_idx), action * 0.5)
 
         self.robot.control_dofs_position(
             self.new_joint_angles, 
             dofs_idx_local = self.joints_local_idx
         )
 
-        reward, terminated = self._calculate_reward()
+        reward, terminated, truncated = self._calculate_reward()
         observation = self._get_obs()
-        truncated = False
         info = {}
 
+        self.timestep += 1
         self.scene.step()
         return observation, reward, terminated, truncated, info
     
 if __name__ == "__main__":
-    env = StandENV()
+    env = StandENV(render=True)
     print(env.reset())
     print(env.step(action=[0.5] * 12))
