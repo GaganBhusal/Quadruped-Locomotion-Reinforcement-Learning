@@ -47,7 +47,7 @@ class StandENV(gym.Env):
 
         self.observation_space = gym.spaces.Box(
             low=-np.inf,
-            high=-np.inf,
+            high=np.inf,
             shape=(28, ),
             dtype=float
         )
@@ -62,6 +62,26 @@ class StandENV(gym.Env):
         self.__initial_positions = np.deg2rad(
             np.array([
                 0, 0, 0, 0, 45, 45, 45, 45, -120, -120, -100, -100
+            ])
+        )
+
+        self.__joint_ranges = np.deg2rad(
+            np.array([
+                (-10, 10),
+                (-10, 10),
+                (-10, 10),
+                (-10, 10),
+
+                (25, 70),
+                (25, 70),
+
+                (40, 110),
+                (40, 110),
+
+                (-130, -70),
+                (-130, -70),
+                (-130, -70),
+                (-130, -70)
             ])
         )
 
@@ -104,7 +124,7 @@ class StandENV(gym.Env):
         roll, yaw, pitch = self._get_ypr()
 
         reward = (
-            z_coordinate_base * 0.5 -
+            z_coordinate_base * 2 -
             (wx**2 + wy**2) -
             (roll**2 + pitch*2) - 
             torch.sum(angular_velocity_joints ** 2)
@@ -112,17 +132,27 @@ class StandENV(gym.Env):
 
         if z_coordinate_base < 0.16:
             self.timestep_low_z_value += 1
+            reward -= 1
+
+        elif z_coordinate_base >= 0.36:
+            reward -= 1
+
+        else:
+            reward += 2
 
         if abs(roll) > 1 or abs(pitch) > 1:
             reward -= 30
             terminated = True
 
+
         if self.timestep_low_z_value >= 1000:
             reward -= 20
             truncated = True
 
-        if self.timestep > 5000:
+        if self.timestep > 7000:
             truncated = True
+
+        reward -= self.__out_of_range
 
         return reward.item(), terminated, truncated
 
@@ -143,10 +173,12 @@ class StandENV(gym.Env):
 
         super().reset()
         self.scene.reset()
+
         self.robot.set_dofs_position(
             self.__initial_positions, 
             dofs_idx_local = self.joints_local_idx
         )
+
         observation = self._get_obs()
         info = {}
         self.timestep = 0
@@ -154,13 +186,30 @@ class StandENV(gym.Env):
         self.scene.step()
         return observation, info
         
+    def __clip_angles(self):
+        self.__out_of_range = 0
+        for i in range(12):
+            current_angle = self.new_joint_angles[i]
+            current_range = self.__joint_ranges[i]
+
+            if current_angle < current_range[0]:
+                self.__out_of_range += abs(current_angle - current_range[0])
+            elif current_angle > current_range[1]:
+                self.__out_of_range += abs(current_angle - current_range[1])
+            
+            self.new_joint_angles[i] = np.clip(current_angle, current_range[0], current_range[1])
+
     def step(self, action):
-        self.new_joint_angles = np.add(self.robot.get_dofs_position(dofs_idx_local = self.joints_local_idx), action * 0.5)
+        self.new_joint_angles = np.add(self.robot.get_dofs_position(dofs_idx_local = self.joints_local_idx), np.array(action) * 0.5)
+
+
+        self.__clip_angles()
 
         self.robot.control_dofs_position(
             self.new_joint_angles, 
             dofs_idx_local = self.joints_local_idx
         )
+
 
         reward, terminated, truncated = self._calculate_reward()
         observation = self._get_obs()
