@@ -15,7 +15,7 @@ class StandENV(gym.Env):
 
         gs.init(backend=backend, logging_level = "warning")
         self.scene = gs.Scene(show_viewer=render)
-
+        self.reward = 0
         plane = self.scene.add_entity(gs.morphs.Plane())
         self.robot = self.scene.add_entity(
             gs.morphs.URDF(file='/home/yayy/My/Codeeeeee/Simulators/Genesis/genesis/assets/urdf/go2/urdf/go2.urdf'),
@@ -65,6 +65,18 @@ class StandENV(gym.Env):
             ])
         )
 
+        self.robot.set_dofs_kp(
+            torch.tensor([100] * 12),
+            dofs_idx_local = self.joints_local_idx
+
+        )
+
+        self.robot.set_dofs_kv(
+            torch.tensor([10] * 12),
+            dofs_idx_local = self.joints_local_idx
+
+        )
+
         self.__joint_ranges = np.deg2rad(
             np.array([
                 (-10, 10),
@@ -103,10 +115,10 @@ class StandENV(gym.Env):
 
     def _get_imu_values(self):
         _linear_acc, _angular_vel = self.imu.read()
-        return _linear_acc, _angular_vel
+        return _linear_acc, _angular_vel.cpu().numpy()
 
     def _get_ypr(self):
-        quat_wxyz = self.robot.get_link("base").get_quat()
+        quat_wxyz = self.robot.get_link("base").get_quat().cpu().numpy()
         quat_xyzw = [quat_wxyz[1], quat_wxyz[2], quat_wxyz[3], quat_wxyz[0]]
         rotation = Rotation.from_quat(quat_xyzw)
         euler_angles = rotation.as_euler("xyz")
@@ -117,44 +129,47 @@ class StandENV(gym.Env):
         terminated = False
         truncated = False
 
-        z_coordinate_base = self.robot.get_link("base").get_pos()[2]
+        self.z_coordinate_base = self.robot.get_link("base").get_pos()[2]
         angular_velocity_joints = self.robot.get_dofs_velocity(dofs_idx_local = self.joints_local_idx[1:])
         # print(f"Angular Velocity Joints : {angular_velocity_joints ** 2}")
         wx, wy, wz = self._get_imu_values()[1]
         roll, yaw, pitch = self._get_ypr()
 
-        reward = (
-            z_coordinate_base * 2 -
-            (wx**2 + wy**2) -
-            (roll**2 + pitch*2) - 
-            torch.sum(angular_velocity_joints ** 2)
+        self.reward += (
+            self.z_coordinate_base * 2 -
+            (wx**2 + wy**2)/(wx + wy)**2 -
+            (roll**2 + pitch*2)/(roll + pitch)**2 - 
+            torch.sum(angular_velocity_joints ** 2)/torch.sum(angular_velocity_joints) ** 2
         )
 
-        if z_coordinate_base < 0.16:
+        if self.z_coordinate_base < 0.23:
             self.timestep_low_z_value += 1
-            reward -= 1
-
-        elif z_coordinate_base >= 0.36:
-            reward -= 1
-
+            self.reward -= 2
         else:
-            reward += 2
+            self.reward += 2
+            # print("here")
+
+        # elif self.z_coordinate_base >= 0.36:
+        #     reward -= 1
+
+        # else:
+        #     reward += 2
 
         if abs(roll) > 1 or abs(pitch) > 1:
-            reward -= 30
+            self.reward -= 5
             terminated = True
 
 
         if self.timestep_low_z_value >= 1000:
-            reward -= 20
+            self.reward -= 10
             truncated = True
 
         if self.timestep > 7000:
             truncated = True
 
-        reward -= self.__out_of_range
+        self.reward -= self.__out_of_range/12
 
-        return reward.item(), terminated, truncated
+        return self.reward.item(), terminated, truncated
 
     
     def _get_obs(self):
@@ -163,9 +178,13 @@ class StandENV(gym.Env):
         wx, wy, wz = self._get_imu_values()[1]
         roll, yaw, pitch = self._get_ypr()
 
+        dofs_position = self.robot.get_dofs_position(dofs_idx_local = self.joints_local_idx).detach().cpu().numpy()
+        dofs_velocity = self.robot.get_dofs_velocity(dofs_idx_local = self.joints_local_idx).detach().cpu().numpy()
+
+        # print(type(dofs_position), type(dofs_velocity), type(wx), type(roll))
         return np.concatenate([
-            self.robot.get_dofs_position(dofs_idx_local = self.joints_local_idx).tolist(),
-            self.robot.get_dofs_velocity(dofs_idx_local = self.joints_local_idx).tolist(),
+            dofs_position,
+            dofs_velocity,
             [wx, wy, roll, pitch],
         ])
 
@@ -174,16 +193,17 @@ class StandENV(gym.Env):
         super().reset()
         self.scene.reset()
 
-        self.robot.set_dofs_position(
-            self.__initial_positions, 
-            dofs_idx_local = self.joints_local_idx
-        )
+        # self.robot.set_dofs_position(
+        #     self.__initial_positions, 
+        #     dofs_idx_local = self.joints_local_idx
+        # )
 
         observation = self._get_obs()
         info = {}
         self.timestep = 0
         self.timestep_low_z_value = 0
         self.scene.step()
+        self.reward = 0
         return observation, info
         
     def __clip_angles(self):
@@ -200,7 +220,7 @@ class StandENV(gym.Env):
             self.new_joint_angles[i] = np.clip(current_angle, current_range[0], current_range[1])
 
     def step(self, action):
-        self.new_joint_angles = np.add(self.robot.get_dofs_position(dofs_idx_local = self.joints_local_idx), np.array(action) * 0.5)
+        self.new_joint_angles = np.add(self.robot.get_dofs_position(dofs_idx_local = self.joints_local_idx).cpu().numpy(), np.array(action) * 0.05)
 
 
         self.__clip_angles()
