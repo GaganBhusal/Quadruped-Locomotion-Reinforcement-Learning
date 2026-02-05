@@ -10,12 +10,14 @@ class WalkENV(gym.Env):
     def __init__(self, render = True, backend = gs.gpu, n_batch = 100):
         super().__init__()
 
-        self.timestep_low_vx_value = 0
+
+        self.device = "cuda"
+        self.episode_len_buffer = torch.zeros(n_batch, device=self.device)
         self.timestep = 0
         self.batch = n_batch
         self.reward = 0
 
-        gs.init(backend=backend, logging_level = "warning")
+        # gs.init(backend=backend, logging_level = "warning")
         self.scene = gs.Scene(show_viewer=render)
 
         plane = self.scene.add_entity(gs.morphs.Plane())
@@ -61,8 +63,8 @@ class WalkENV(gym.Env):
             dtype=float
         )
 
-        self.__initial_positions = np.deg2rad(
-            np.array([
+        self.__initial_positions = torch.deg2rad(
+            torch.tensor([
                 0, 0, 0, 0, 45, 45, 45, 45, -120, -120, -100, -100
             ])
         )
@@ -92,7 +94,6 @@ class WalkENV(gym.Env):
 
     def __get_linear_velocity(self):
         vel_body = self.robot.get_link("base").get_vel()
-        # print(len(vel_body))
         return torch.tensor(vel_body)
 
     def _get_internal_info(self):
@@ -107,9 +108,6 @@ class WalkENV(gym.Env):
                 low, high = np.rad2deg(joint.dofs_limit)[0]
                 self.joints_limit_low.append(low.item())
                 self.joints_limit_high.append(high.item())
-                # self.ranges.append(torch.rad2deg(torch.tensor(joint.dofs_limit)))/
-                # print(f"Joint Name : {joint.name}, DOF : {joint.n_dofs}, type : {type(joint)}, Axis : {torch.rad2deg(torch.tensor(joint.dofs_limit))}")
-        # print(f"Ranges : {self.joints_limit_low}\n{self.joints_limit_high}")
 
     def _get_imu_values(self):
         _linear_acc, _angular_vel = self.imu.read()
@@ -128,7 +126,8 @@ class WalkENV(gym.Env):
         terminated = False
         truncated = False
 
-        self.z_coordinate_base = self.robot.get_link("base").get_pos()[2]
+        # print(self.robot.get_link("base").get_pos())
+        # self.z_coordinate_base = self.robot.get_link("base").get_pos()[2]
         angular_velocity_joints = self.robot.get_dofs_velocity(dofs_idx_local = self.joints_local_idx[1:])
         # print(f"Angular Velocity Joints : {angular_velocity_joints ** 2}")
         # print(self._get_imu_values().shape)
@@ -143,18 +142,29 @@ class WalkENV(gym.Env):
         #     (roll**2 + pitch*2) - 
         #     torch.sum(angular_velocity_joints ** 2)
         # )
+
         vx = linear_velocity[:, 0]
-        self.reward += torch.exp(-1.5 * (vx - 1)**2)
+        vy = linear_velocity[:, 1]
+        # print(f"\n\n\n{vx}\n\n\n")
+        reward = torch.exp(-2.0 * (vx - 0.6)**2)
+        reward -= torch.sum(torch.square(ypr[:, :2]), dim=1)
+        reward -= 2 * torch.abs(vy)
 
-        for i in range(self.batch):
-            if vx[i] < 0.02:
-                self.timestep_low_vx_value += 1
-        # if z_coordinate_base < 0.16:
-        #     self.timestep_low_z_value += 1
 
-            if abs(ypr[:, 0][i]) > 1 or abs(ypr[:, 2][i]) > 1:
-                reward -= 30
-                terminated = True
+
+        tilted_mask1 = abs(ypr[:, 0]) > 1
+        tilted_mask2 =  abs(ypr[:, 2]) > 1
+        # print(tilted_mask2, tilted_mask1)
+        tilted_mask = tilted_mask1 | tilted_mask2
+        # for i in range(self.batch):
+        #     if vx[i] < 0.02:
+        #         self.timestep_low_vx_value += 1
+        # # if z_coordinate_base < 0.16:
+        # #     self.timestep_low_z_value += 1
+
+            # if abs(ypr[:, 0][i]) > 1 or abs(ypr[:, 2][i]) > 1:
+            #     reward -= 30
+            #     terminated = True
 
         # if vx<0.02:
         #     self.timestep_low_vx_value += 1
@@ -175,36 +185,24 @@ class WalkENV(gym.Env):
         #     terminated = True
 
 
-        if self.timestep_low_vx_value >= 1000:
-            self.reward -= 20
-            truncated = True
+        # if self.timestep_low_vx_value >= 1000:
+        #     self.reward -= 20
+        #     truncated = True
+        reward[tilted_mask] -= 10
 
-        if self.timestep > 10000:
-            truncated = True
+        terminated = tilted_mask
+        self.episode_len_buffer += 1
+        truncated = self.episode_len_buffer > 2000
+        # if self.timestep > 10000:
+        #     truncated = True
 
-        self.reward -= self.__out_of_range
+        # self.reward -= self.__out_of_range
 
-        return self.reward, terminated, truncated
-
+        return reward, terminated, truncated
     
     def _get_obs(self):
-        # print(self.robot.get_dofs_position(dofs_idx_local = self.joints_local_idx[1:]).numpy())
-        # print(self._get_imu_values())
         angular_vel = self._get_imu_values()[1]
-        # print(angular_vel[:, 0])
         ypr = self._get_ypr()
-        # print(angular_vel.shape, ypr.shape)
-
-
-        # print(f"Printing shapes \n ------------------------\n\n{self.robot.get_dofs_position(dofs_idx_local = self.joints_local_idx).shape}\n{self.robot.get_dofs_velocity(dofs_idx_local = self.joints_local_idx).shape}\n{torch.stack([angular_vel[:, [0, 1]]]).shape}\n{torch.stack([ypr[:, [0, 2]]]).shape}")
-        
-        #         return np.concatenate([
-        #     dofs_position,     #12
-        #     dofs_velocity,     #12
-        #     self._get_imu_values()[1],      #3
-        #     self.__get_linear_velocity(),        #3
-        #     [roll, pitch],      #2
-        # ])
         
         return torch.cat([
             self.robot.get_dofs_position(dofs_idx_local = self.joints_local_idx),
@@ -214,21 +212,58 @@ class WalkENV(gym.Env):
             torch.stack([ypr[:, [0, 2]]]).squeeze(0),
         ], dim = 1)
 
+    def reset_env_idx(self, envs_ids):
+
+        if len(envs_ids) == 0:
+            return
+        
+        # print(len(envs_ids))
+        initial_position = torch.tensor(self.__initial_positions).repeat(len(envs_ids), 1)
+        # initial_position += (torch.rand_like(initial_position) - 0.5) * 0.1
+
+
+
+        # print(initial_position.shape)
+        # print(len(self.joints_local_idx))
+        # print(f"The env idx is {envs_ids}, It must be reset !!!!")
+        # print(len(self.joints_local_idx))
+        # self.reward[envs_ids] = 0
+        self.robot.set_dofs_position(
+            initial_position,
+            dofs_idx_local = self.joints_local_idx,
+            envs_idx = envs_ids
+        )
+        zeros = torch.zeros((len(envs_ids), 12), device=self.device)
+        self.robot.set_dofs_velocity(zeros, dofs_idx_local=self.joints_local_idx, envs_idx=envs_ids)
+
+        base_quat = torch.tensor([1, 0, 0, 0], device=self.device).repeat(len(envs_ids), 1)
+        self.robot.set_quat(
+            quat=base_quat, 
+            envs_idx=envs_ids
+        )
+
+        self.episode_len_buffer[envs_ids] = 0
+        
+
     def reset(self, *, seed=None, options=None):
 
         super().reset()
         self.scene.reset()
 
-        self.robot.set_dofs_position(
-            self.__initial_positions, 
-            dofs_idx_local = self.joints_local_idx
-        )
+        # self.reset_env_idx(
+        #     envs_ids=
+        # )
+
+        # self.robot.set_dofs_position(
+        #     self.__initial_positions, 
+        #     dofs_idx_local = self.joints_local_idx
+        # )
 
         observation = self._get_obs()
         info = {}
-        self.timestep = 0
-        self.timestep_low_vx_value = 0
-        self.reward = 0
+        # self.timestep = 0
+        # self.episode_len_buffer = 0
+        # self.reward = 0
         self.scene.step()
         return observation.detach().cpu().numpy(), info
         
@@ -249,14 +284,19 @@ class WalkENV(gym.Env):
                 self.new_joint_angles[i][j] = np.clip(current_angle, current_range[0], current_range[1])
 
     def step(self, action):
-        # print(action)
-        # print(action.shape)
-        # print(type(self.robot.get_dofs_position(dofs_idx_local = self.joints_local_idx).detach().cpu().numpy()))
-        self.new_joint_angles = np.add(np.array(self.robot.get_dofs_position(dofs_idx_local = self.joints_local_idx).detach().cpu().numpy()), np.array(action) * 0.5)
 
+        self.new_joint_angles = np.add(
+            np.array(
+                self.robot.get_dofs_position(
+                dofs_idx_local = self.joints_local_idx).detach().cpu().numpy()
+            ), 
+            np.array(action) * 0.5
+        )
 
+        # Clipping the angles if they exceeded the range
         self.__clip_angles()
 
+        # Set Position 
         self.robot.control_dofs_position(
             self.new_joint_angles, 
             dofs_idx_local = self.joints_local_idx
@@ -264,17 +304,31 @@ class WalkENV(gym.Env):
 
 
         reward, terminated, truncated = self._calculate_reward()
+        # print(terminated, truncated)
+        dones = torch.bitwise_or(terminated, truncated)
+        # print(dones)
+        reset_ids = torch.nonzero(dones).flatten()
         observation = self._get_obs()
         # print("Error from obs")
         info = {}
+        
+        if len(reset_ids) > 0:
+            self.reset_env_idx(reset_ids)
 
         self.timestep += 1
         self.scene.step()
         # print(observation.shape)
-        return observation.detach().cpu().numpy(), reward.detach().cpu().numpy(), terminated, truncated, info
+
+        # print(f"The dones shape is {dones.shape}")
+        return observation.detach().cpu().numpy(), reward.detach().cpu().numpy(), dones.detach().cpu().numpy(), info
     
 
 if __name__ == "__main__":
-    env = StandENV(render=True)
-    print(env.reset())
-    print(env.step(action=[0.5] * 12))
+    env = WalkENV(render=True, n_batch=2)
+
+    state, info = env.reset()
+
+    while True:
+        action = env.action_space.sample()
+        state, reward, ter, trun, info = env.step(action)
+
