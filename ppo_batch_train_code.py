@@ -18,48 +18,59 @@ os.makedirs("Checkpoints", exist_ok=True)
 
 
 class Actor(nn.Module):
-
     def __init__(self, in_shape, out_shape):
-        # print(in_shape, out_shape)
         super(Actor, self).__init__()
-        self.fc1 = nn.Linear(in_shape[0], 128)
-        self.fc2 = nn.Linear(128, 256)
-        self.mean = nn.Linear(256, out_shape[0])
-        self.sd = nn.Linear(256, out_shape[0])
+        
+        self.net = nn.Sequential(
+            nn.Linear(in_shape[0], 512),
+            nn.ELU(),
+            nn.Linear(512, 256),
+            nn.ELU(),
+            nn.Linear(256, 128),
+            nn.ELU()
+        )
+
+        self.mean = nn.Linear(128, out_shape[0])
+        self.log_std = nn.Linear(128, out_shape[0])
 
     def forward(self, x):
-        # print(x.shape)/
-        x = self.fc1(x)
-        x = torch.relu(x)
-        x = torch.relu(self.fc2(x))
-
+        x = self.net(x)
+        
         mean = self.mean(x)
-        log_sd = self.sd(x)
-        sd = torch.exp(log_sd)     
-           
+        log_sd = self.log_std(x)
+        
+
+        log_sd = torch.clamp(log_sd, min=-20, max=2) 
+        
+        sd = torch.exp(log_sd)
+        
         return mean, sd
 
     
     
 class Critic(nn.Module):
-
     def __init__(self, in_shape):
         super(Critic, self).__init__()
-        self.fc = nn.Sequential(
-            nn.Linear(in_shape[0], 64),
-            nn.ReLU(),
-            nn.Linear(64, 1),
+
+        self.net = nn.Sequential(
+            nn.Linear(in_shape[0], 512),
+            nn.ELU(),
+            nn.Linear(512, 256),
+            nn.ELU(),
+            nn.Linear(256, 128),
+            nn.ELU(),
+            nn.Linear(128, 1)
         )
 
     def forward(self, x):
-        return self.fc(x)
- 
+        return self.net(x)
 
 class   PPOClip:
     
     def __init__(self, 
                 env,
                 eval_env,
+                n_batch = 1,
                 actor = None,
                 critic = None,
 
@@ -74,14 +85,20 @@ class   PPOClip:
                 beta = 0.001,
                 actor_max_norm = 0.5,
                 critic_max_norm = 0.5,
-                epochs = 5
+                epochs = 5,
+                previous_weights = None
                 ):
         
         self.env = env
         self.eval_env = eval_env
+        self.n_batch = n_batch
         # gs.init(backend=backend, logging_level = "warning")
         self.actor = Actor(env.observation_space.shape, env.action_space.shape)
         self.critic = Critic(env.observation_space.shape)
+
+        if previous_weights:
+            self.actor.load_state_dict(previous_weights['actor'])
+            self.critic.load_state_dict(previous_weights['critic'])
 
         self.device = device
 
@@ -101,7 +118,7 @@ class   PPOClip:
 
         self.epochs = epochs
 
-        self.writer = SummaryWriter('experiments/PPO_Clip1')
+        self.writer = SummaryWriter('experiments/PPO_Clip4')
 
 
     def _sample_action(self, state):
@@ -137,6 +154,7 @@ class   PPOClip:
             # while not done:            
             action, log_prob = self._sample_action(state)
             next_state, reward, done, _ = self.env.step(action)
+            # print(next_state.shape)
             # print(done)
             # done = ter or trun
             episode_reward += reward
@@ -145,7 +163,7 @@ class   PPOClip:
             actions_buffer.append(action)
             reward_buffer.append(reward)
             log_prob_buffer.append(log_prob.detach().cpu().numpy())
-            done_buffer.append(np.bitwise_not(done))
+            done_buffer.append(1 - done.astype(int))
 
             
 
@@ -157,12 +175,12 @@ class   PPOClip:
         
 
         states_buffer = torch.tensor(np.array(states_buffer), dtype=torch.float).to(self.device)
-        actions_buffer = torch.tensor(actions_buffer, dtype=torch.float).to(self.device)
-        done_buffer = torch.tensor(done_buffer).to(self.device)
-        reward_buffer = torch.tensor(reward_buffer).to(self.device)
+        actions_buffer = torch.tensor(np.array(actions_buffer), dtype=torch.float).to(self.device)
+        done_buffer = torch.tensor(np.array(done_buffer)).to(self.device)
+        reward_buffer = torch.tensor(np.array(reward_buffer)).to(self.device)
         # print(type(log_prob_buffer))
         log_prob_buffer = torch.tensor(log_prob_buffer, dtype=torch.float).to(self.device)
-        actions_buffer = torch.tensor(actions_buffer, dtype=torch.float).to(self.device)
+        # actions_buffer = torch.tensor(actions_buffer, dtype=torch.float).to(self.device)
 
         with torch.no_grad():
             current_state_value = self.critic(states_buffer).squeeze(-1)
@@ -229,9 +247,11 @@ class   PPOClip:
 
     def get_reward__(self):
 
-
+        a = 0
         state, info = self.eval_env.reset()
         total_reward = 0
+        total_dones = 0
+        total_steps = 0
         # while True:
         #     action = self.predict(state)
         #     state, reward, ter, trun, info = self.eval_env.step(action)
@@ -241,8 +261,13 @@ class   PPOClip:
             action = self.predict(state)
             state, reward, dones, _ = self.eval_env.step(action)
             total_reward += reward
-            # print(dones)
+            total_steps += 1
             if dones:
+                total_dones += 1
+                print(total_reward)
+                total_steps = 0
+                total_reward = 0
+            if total_dones >= 2 and total_steps >= 200:
                 return total_reward
             
     def predict(self, states):
@@ -268,6 +293,7 @@ class   PPOClip:
                 actor_loss = 0
                 critic_loss = 0
                 batch_count = 0
+                critic_prediction = 0
 
 
                 for idx in range(0, len(train_data), self.batch_size):
@@ -275,12 +301,12 @@ class   PPOClip:
                     states, actions, log_probs, returns, gae, state_values = zip(*data)
                     # print(type(states), type(actions), type(log_probs), type(returns), type(gae))
 
-                    states = torch.tensor(states, dtype=torch.float).to(self.device)
+                    states = torch.tensor(np.array(states), dtype=torch.float).to(self.device)
                     actions = torch.tensor(np.array(actions), dtype= torch.float).to(self.device)
-                    log_probs = torch.tensor(log_probs, dtype=torch.float).to(self.device)
-                    gae = torch.tensor(gae, dtype=torch.float).to(self.device)
-                    returns = torch.tensor(returns, dtype=torch.float).to(self.device)
-                    state_values = torch.tensor(state_values, dtype=torch.float).to(self.device)
+                    log_probs = torch.tensor(np.array(log_probs), dtype=torch.float).to(self.device)
+                    gae = torch.tensor(np.array(gae), dtype=torch.float).to(self.device)
+                    returns = torch.tensor(np.array(returns), dtype=torch.float).to(self.device)
+                    state_values = torch.tensor(np.array(state_values), dtype=torch.float).to(self.device)
                     # print(type(states), type(actions), type(log_probs), type(returns), type(gae))
 
                     mean, std = self.actor(states)
@@ -291,6 +317,7 @@ class   PPOClip:
                     entropy = dist.entropy().mean()
 
                     critic_output_state_values = self.critic(states).squeeze(-1)
+                    critic_prediction += critic_output_state_values
 
                     # I divided log probs haha (DUMB...........)
 
@@ -301,6 +328,7 @@ class   PPOClip:
                     clip2 = torch.clip(importance_sampling_ratio, 1 - self.epsilon, 1 + self.epsilon) * gae
                     actor_loss = -torch.minimum(clip1, clip2).mean() - self.beta * entropy
                     # print(critic_output_state_values.shape, returns.shape)
+                    # print(returns, critic_output_state_values/)
                     critic_loss = nn.functional.mse_loss(critic_output_state_values, returns, reduction="mean")
 
                     actor_loss_per_epoch += actor_loss.item()
@@ -326,29 +354,31 @@ class   PPOClip:
 
                 avg_actor_loss = actor_loss_per_epoch/batch_count
                 avg_critic_loss = critic_loss_per_epoch/batch_count
+                average_return = critic_prediction.mean()
 
-                reward_after_current_epoch = self.get_reward__()
-                self.writer.add_scalars(
-                    main_tag="Training....",
-                    tag_scalar_dict={
-                        "Actor Loss" : avg_actor_loss,
-                        "Critic Loss" : avg_critic_loss,
-                        "Total Reward" : reward_after_current_epoch
-                        },     
-                    global_step=current_timestep * epoch + 1          
-                )
+                self.writer.add_scalar("Loss/Actor", avg_actor_loss, current_timestep)
+                self.writer.add_scalar("Loss/Critic", avg_critic_loss, current_timestep)
+                self.writer.add_scalar("Reward/Average Return From Critic", average_return, current_timestep)
 
+                self.writer.flush()
+                
+            
             current_timestep += self.episode_rollouts
-            print(f"\n\nActor Loss : {avg_actor_loss:.4f}\nCritic Loss : {avg_critic_loss:.4f}\nTotal Reward : {reward_after_current_epoch}\n\n\n")
-            print(f"Total Timestep : {current_timestep}")
-            self.save_models((current_timestep+1)//2048)
+            total_iterations = (current_timestep)//self.episode_rollouts
+            print(f"\n\nActor Loss : {avg_actor_loss:.4f}\nCritic Loss : {avg_critic_loss:.4f}\nActual Return : {returns.mean()}\nPredicted Return :{critic_output_state_values.mean()}\n")
+            print(f"Iteration Number : {total_iterations}\t Total Timesteps : {total_iterations * self.episode_rollouts}\t Totak Data Collected : {self.n_batch * total_iterations * self.episode_rollouts}")
+            self.save_models(total_iterations)
+            print(f"\n\n")
+            print("==" * 50)
 
     def save_models(self, i):
         checkpoint = {
             "actor" : self.actor.state_dict(),
             "critic" : self.critic.state_dict()
         }
-        torch.save(checkpoint, f"Checkpoints/checkpoint{i}.pth")
+        torch.save(checkpoint, f"Checkpoints/checkpoint_second_lot{i}.pth")
+        print(f"Saved checkpoint {i} !!!")
+
 
 if __name__ == "__main__":
     env = gym.make("CartPole-v1", render_mode="rgb_array")
