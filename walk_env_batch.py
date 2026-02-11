@@ -17,7 +17,7 @@ class WalkENV(gym.Env):
         self.batch = n_batch
         self.reward = 0
         self.target_base_height = 0.3
-        self.target_vx = 0.5
+        self.target_vx = 1.0
         self.target_wz = 0.0
         self.action_scale = 0.25
         self.dt = 0.002
@@ -137,7 +137,7 @@ class WalkENV(gym.Env):
          
         terminated = False
         truncated = False
-        sigma = 0.25
+        sigma = 0.2
 
         linear_velocity = self.__get_linear_velocity()
         angular_velocity = self._get_imu_values()
@@ -151,6 +151,9 @@ class WalkENV(gym.Env):
         vz = linear_velocity[:, 2]
 
         reward_alive = 1.0
+        is_still = vx < 0.1
+        still_penalty = -is_still.float()
+        # linear_velocity_reward = -torch.square(vx - self.target_vx) + self.target_vx
         linear_velocity_reward = torch.exp(-torch.square(vx - self.target_vx)/sigma)
         reward_angular_velocity_yaw = torch.exp(-torch.square( angular_velocity[:, 2] - self.target_wz)/sigma)
         linear_vel_z_axis_penalty = -torch.square(vz)
@@ -167,8 +170,8 @@ class WalkENV(gym.Env):
         # print(linear_velocity_reward[0], linear_vel_z_axis_penalty[0], pitch_roll_penalty[0], joint_acceleration_penalty[0], action_smoothness_penalty[0],
         #       action_rate_penalty[0], height_penalty[0], orientation_penalty[0], torque_penalty[0])
         total_reward = (
-            linear_velocity_reward * 1.0 +
-            linear_vel_z_axis_penalty * 2.0 +
+            linear_velocity_reward * 3 +
+            linear_vel_z_axis_penalty * 0.5 +
             pitch_roll_penalty * 0.05 +
             height_penalty * 2 +
             joint_acceleration_penalty * 2.5e-8 +
@@ -176,11 +179,19 @@ class WalkENV(gym.Env):
             action_rate_penalty * 0.01 +
             action_smoothness_penalty * 0.01 +
             orientation_penalty * 0.2 +
-            reward_alive
+            reward_alive * 0.1  
+            # still_penalty * 5
         )
 
-        terminated = base_height < 0.15
-        total_reward[terminated] -= 2
+        roll_pitch_yaw = self._get_ypr()
+
+        tilted_mask1 = abs(roll_pitch_yaw[:, 0]) > 1
+        tilted_mask2 =  abs(roll_pitch_yaw[:, 1]) > 1
+        tilted_mask = tilted_mask1 | tilted_mask2
+        low_base_height = base_height < 0.13
+
+        terminated = tilted_mask | low_base_height
+        total_reward[terminated] -= 7
 
         return total_reward, terminated
     
@@ -220,7 +231,7 @@ class WalkENV(gym.Env):
         base_quat = torch.tensor([1, 0, 0, 0], device=self.device).repeat(len(envs_ids), 1)
         self.robot.set_quat(quat=base_quat, envs_idx=envs_ids)
 
-        base_pos = torch.tensor([0, 0, 0.35], device=self.device).repeat(len(envs_ids), 1)
+        base_pos = torch.tensor([0, 0, 0.2], device=self.device).repeat(len(envs_ids), 1)
         self.robot.set_pos(base_pos, envs_idx=envs_ids)
 
         self.action_t_1[envs_ids] = 0
@@ -238,25 +249,7 @@ class WalkENV(gym.Env):
         self.scene.step()
         return observation.detach().cpu().numpy(), info
         
-
-    def __clip_angles(self):
-        self.__out_of_range = 0
-        for i in range(self.batch):
-            for j in range(12):
-                current_angle = self.new_joint_angles[i][j]
-                # print(current_angle.shape)
-                current_range = self.__joint_ranges[j]
-                # print(current_range.shape)
-
-                if current_angle < current_range[0]:
-                    self.__out_of_range += abs(current_angle - current_range[0])
-                elif current_angle > current_range[1]:
-                    self.__out_of_range += abs(current_angle - current_range[1])
-                
-                self.new_joint_angles[i][j] = np.clip(current_angle, current_range[0], current_range[1])
-
     def step(self, action):
-        
         action = torch.tensor(action, dtype=torch.float)
         self.action_t = action.clone()
 
