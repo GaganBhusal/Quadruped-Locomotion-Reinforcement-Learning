@@ -2,15 +2,10 @@ import numpy as np
 import torch.nn as nn
 import torch
 import gymnasium as gym
-from tqdm import tqdm
 from tqdm.notebook import trange
 import matplotlib.pyplot as plt
-import random
 from torch.utils.tensorboard import SummaryWriter
 import os
-import math
-from walk_env_batch import WalkENV
-import genesis as gs
 
 
 os.makedirs("Checkpoints", exist_ok=True)
@@ -20,7 +15,7 @@ os.makedirs("Checkpoints", exist_ok=True)
 class Actor(nn.Module):
     def __init__(self, in_shape, out_shape):
         super(Actor, self).__init__()
-        
+        # print(in_shape, out_shape)
         self.net = nn.Sequential(
             nn.Linear(in_shape[0], 512),
             nn.ELU(),
@@ -29,7 +24,7 @@ class Actor(nn.Module):
             nn.Linear(256, 128),
             nn.ELU()
         )
-
+        # print(out_shape)
         self.mean = nn.Linear(128, out_shape[0])
         self.log_std = nn.Linear(128, out_shape[0])
 
@@ -69,7 +64,6 @@ class   PPOClip:
     
     def __init__(self, 
                 env,
-                eval_env,
                 n_batch = 1,
                 actor = None,
                 critic = None,
@@ -77,20 +71,19 @@ class   PPOClip:
                 device = "cpu",
                 rollouts = 2048,
 
-                gamma = 0.9,
-                gamma_gae = 0.99,
+                gamma = 0.99,
+                gamma_gae = 0.95,
                 _lambda = 0.5,
                 batch_size = 32,
-                epsilon = 0.1,
+                epsilon = 0.2,
                 beta = 0.001,
-                actor_max_norm = 0.5,
-                critic_max_norm = 0.5,
+                actor_max_norm = 1,
+                critic_max_norm = 1,
                 epochs = 5,
                 previous_weights = None
                 ):
         
         self.env = env
-        self.eval_env = eval_env
         self.n_batch = n_batch
         # gs.init(backend=backend, logging_level = "warning")
         self.actor = Actor(env.observation_space.shape, env.action_space.shape)
@@ -102,8 +95,8 @@ class   PPOClip:
 
         self.device = device
 
-        self.optimizer_actor = torch.optim.Adam(self.actor.parameters(), lr = 1e-4)
-        self.optimizer_critic = torch.optim.Adam(self.critic.parameters(), lr = 1e-4)
+        self.optimizer_actor = torch.optim.Adam(self.actor.parameters(), lr = 5e-4)
+        self.optimizer_critic = torch.optim.Adam(self.critic.parameters(), lr = 5e-4)
 
         self.episode_rollouts = rollouts
         self.gamma = gamma
@@ -118,17 +111,20 @@ class   PPOClip:
 
         self.epochs = epochs
 
-        self.writer = SummaryWriter('experiments/PPO_Clip4')
+        self.writer = SummaryWriter('experiments/BAck')
 
-
+    @torch.no_grad()
     def _sample_action(self, state):
+        
         state = torch.tensor(state, dtype=torch.float).to(self.device)
+        # print(state.shape)
         mean, std = self.actor(state)
         dist = torch.distributions.Normal(
             mean, std
         )
         
         action = dist.sample()
+        # print(action.shape)
         # print(action)
         log_prob = dist.log_prob(action)
 
@@ -149,14 +145,10 @@ class   PPOClip:
         
         state, _ = self.env.reset()
         for current_rollout in range(self.episode_rollouts):
-            # state, info = self.env.reset()/
-            # done = False
-            # while not done:            
+            # print(state.shape)
             action, log_prob = self._sample_action(state)
             next_state, reward, done, _ = self.env.step(action)
-            # print(next_state.shape)
-            # print(done)
-            # done = ter or trun
+
             episode_reward += reward
 
             states_buffer.append(state)
@@ -165,48 +157,25 @@ class   PPOClip:
             log_prob_buffer.append(log_prob.detach().cpu().numpy())
             done_buffer.append(1 - done.astype(int))
 
-            
-
             state = next_state
-            # if done:
-            #     episode_reward = 0
-            #     state, _ = self.env.reset()
-            
+
         
 
         states_buffer = torch.tensor(np.array(states_buffer), dtype=torch.float).to(self.device)
         actions_buffer = torch.tensor(np.array(actions_buffer), dtype=torch.float).to(self.device)
         done_buffer = torch.tensor(np.array(done_buffer)).to(self.device)
         reward_buffer = torch.tensor(np.array(reward_buffer)).to(self.device)
-        # print(type(log_prob_buffer))
         log_prob_buffer = torch.tensor(log_prob_buffer, dtype=torch.float).to(self.device)
-        # actions_buffer = torch.tensor(actions_buffer, dtype=torch.float).to(self.device)
 
         with torch.no_grad():
             current_state_value = self.critic(states_buffer).squeeze(-1)
             last_value = self.critic(torch.FloatTensor(state).to(self.device)).squeeze(1)
             
 
-        # next_state_values = torch.zeros_like(current_state_value)
-        # next_state_values[:-1] = current_state_value[1:]
-        # next_state_values[done_buffer] = 0
-
-        # print(states_buffer.shape, done_buffer.shape, log_prob_buffer.shape, actions_buffer.shape, reward_buffer.shape)
-        # print(current_state_value.shape, next_state_values.shape)
-        # td_error = reward_buffer + self.gamma * next_state_values - current_state_value
-
         advantage_buffer = torch.zeros_like(reward_buffer)
         total_return_buffer = torch.zeros_like(reward_buffer)
-        gae = torch.zeros(self.batch_size, device=self.device)
-
         i = len(states_buffer) -1
-
-        total_returns=0
         gae = 0
-
-        # for t in reversed(range(self.n_steps)):
-        #     if t == self.n_steps - 1:
-
 
         while i>=0:
 
@@ -221,9 +190,6 @@ class   PPOClip:
             gae = delta + self.gamma * self.gamma_gae * mask * gae
             ret = gae + current_state_value[i]
 
-            # print(gae.shape)
-            # print(mask.shape, next_val.shape, reward_buffer.shape, delta.shape, current_state_value[i].shape ,gae.shape, ret.shape)
-            # print(f"\n\n\n{gae}")
             advantage_buffer[i] = gae
             total_return_buffer[i] = ret
 
@@ -231,7 +197,8 @@ class   PPOClip:
 
 
         advantage_buffer = (advantage_buffer - advantage_buffer.mean())/(advantage_buffer.std() + 1e-8)
-        
+        # Returning tensors directly
+        return states_buffer, actions_buffer, log_prob_buffer, total_return_buffer, advantage_buffer, current_state_value
         mainBuffer = list(zip(
             states_buffer.tolist(),
             actions_buffer.tolist(),
@@ -245,31 +212,32 @@ class   PPOClip:
         return mainBuffer
     
 
-    def get_reward__(self):
+    # def get_reward__(self):
 
-        a = 0
-        state, info = self.eval_env.reset()
-        total_reward = 0
-        total_dones = 0
-        total_steps = 0
-        # while True:
-        #     action = self.predict(state)
-        #     state, reward, ter, trun, info = self.eval_env.step(action)
-        #     state, _ = self.env.reset()
-        #     total_reward = 0
-        while True:
-            action = self.predict(state)
-            state, reward, dones, _ = self.eval_env.step(action)
-            total_reward += reward
-            total_steps += 1
-            if dones:
-                total_dones += 1
-                print(total_reward)
-                total_steps = 0
-                total_reward = 0
-            if total_dones >= 2 and total_steps >= 200:
-                return total_reward
-            
+    #     a = 0
+    #     state, info = self.eval_env.reset()
+    #     total_reward = 0
+    #     total_dones = 0
+    #     total_steps = 0
+    #     # while True:
+    #     #     action = self.predict(state)
+    #     #     state, reward, ter, trun, info = self.eval_env.step(action)
+    #     #     state, _ = self.env.reset()
+    #     #     total_reward = 0
+    #     while True:
+    #         action = self.predict(state)
+    #         state, reward, dones, _ = self.eval_env.step(action)
+    #         total_reward += reward
+    #         total_steps += 1
+    #         if dones:
+    #             total_dones += 1
+    #             print(total_reward)
+    #             total_steps = 0
+    #             total_reward = 0
+    #         if total_dones >= 2 and total_steps >= 200:
+    #             return total_reward
+    
+    @torch.no_grad()      
     def predict(self, states):
         state = torch.tensor(states, dtype=torch.float).to(self.device)
         mean, std = self.actor(state)
@@ -283,31 +251,25 @@ class   PPOClip:
         current_timestep = 0
         while current_timestep <= timesteps:
 
-            train_data = self.collect_rollout()
-            np.random.shuffle(train_data)
+            b_states, b_actions, b_log_probs, b_returns, b_advantage, b_state_values = self.collect_rollout()
+            dataset_size = len(b_states)
+            indices = torch.arange(dataset_size)
             
-            actor_loss_per_epoch = 0
-            critic_loss_per_epoch = 0
 
             for epoch in range(self.epochs):
-                actor_loss = 0
-                critic_loss = 0
+                actor_loss_per_epoch = 0
+                critic_loss_per_epoch = 0
+
                 batch_count = 0
-                critic_prediction = 0
 
-
-                for idx in range(0, len(train_data), self.batch_size):
-                    data = train_data[idx:idx + self.batch_size]
-                    states, actions, log_probs, returns, gae, state_values = zip(*data)
-                    # print(type(states), type(actions), type(log_probs), type(returns), type(gae))
-
-                    states = torch.tensor(np.array(states), dtype=torch.float).to(self.device)
-                    actions = torch.tensor(np.array(actions), dtype= torch.float).to(self.device)
-                    log_probs = torch.tensor(np.array(log_probs), dtype=torch.float).to(self.device)
-                    gae = torch.tensor(np.array(gae), dtype=torch.float).to(self.device)
-                    returns = torch.tensor(np.array(returns), dtype=torch.float).to(self.device)
-                    state_values = torch.tensor(np.array(state_values), dtype=torch.float).to(self.device)
-                    # print(type(states), type(actions), type(log_probs), type(returns), type(gae))
+                for idx in range(0, dataset_size, self.batch_size):
+                    batch_idx = indices[idx: idx + self.batch_size]
+                    states = b_states[batch_idx]
+                    actions = b_actions[batch_idx]
+                    log_probs = b_log_probs[batch_idx]
+                    gae = b_advantage[batch_idx]
+                    returns = b_returns[batch_idx]
+                    state_values = b_state_values[batch_idx]
 
                     mean, std = self.actor(states)
                     dist = torch.distributions.Normal(
@@ -317,11 +279,10 @@ class   PPOClip:
                     entropy = dist.entropy().mean()
 
                     critic_output_state_values = self.critic(states).squeeze(-1)
-                    critic_prediction += critic_output_state_values
 
                     # I divided log probs haha (DUMB...........)
 
-                    importance_sampling_ratio = torch.exp(log_distribution.sum(dim=-1) - log_probs.sum(dim=-1))
+                    importance_sampling_ratio = torch.exp(torch.clamp(log_distribution.sum(dim=-1) - log_probs.sum(dim=-1), -10, 10))
                     # print(importance_sampling_ratio.shape, gae.shape)
 
                     clip1 = importance_sampling_ratio * gae
@@ -354,13 +315,11 @@ class   PPOClip:
 
                 avg_actor_loss = actor_loss_per_epoch/batch_count
                 avg_critic_loss = critic_loss_per_epoch/batch_count
-                average_return = critic_prediction.mean()
 
-                self.writer.add_scalar("Loss/Actor", avg_actor_loss, current_timestep)
-                self.writer.add_scalar("Loss/Critic", avg_critic_loss, current_timestep)
-                self.writer.add_scalar("Reward/Average Return From Critic", average_return, current_timestep)
-
-                self.writer.flush()
+            self.writer.add_scalar("Loss/Actor", avg_actor_loss, current_timestep)
+            self.writer.add_scalar("Loss/Critic", avg_critic_loss, current_timestep)
+            self.writer.add_scalar("Reward/Average Return From Critic", b_returns.mean().item(), current_timestep)
+            self.writer.flush()
                 
             
             current_timestep += self.episode_rollouts
@@ -376,13 +335,12 @@ class   PPOClip:
             "actor" : self.actor.state_dict(),
             "critic" : self.critic.state_dict()
         }
-        torch.save(checkpoint, f"Checkpoints/checkpoint_second_lot{i}.pth")
+        torch.save(checkpoint, f"Checkpoints/back_{i}.pth")
         print(f"Saved checkpoint {i} !!!")
 
 
 if __name__ == "__main__":
     env = gym.make("CartPole-v1", render_mode="rgb_array")
-    actor = Actor()
-    critic = Critic()
-    ppo = PPOClip(env, actor, critic, )
+ 
+    ppo = PPOClip(env)
     ppo.train(500000)
