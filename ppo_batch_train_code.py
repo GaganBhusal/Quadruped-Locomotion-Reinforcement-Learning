@@ -312,7 +312,6 @@ class   PPOClip:
 
                     batch_count += 1
 
-
                 avg_actor_loss = actor_loss_per_epoch/batch_count
                 avg_critic_loss = critic_loss_per_epoch/batch_count
 
