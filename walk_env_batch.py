@@ -3,27 +3,29 @@ import torch
 import numpy as np
 import gymnasium as gym
 from scipy.spatial.transform import Rotation
-
+import tensordict
 
 class WalkENV(gym.Env):
 
-    def __init__(self, render = True, backend = gs.gpu, n_batch = 100, ):
+    def __init__(self, render = True, backend = gs.gpu, num_envs = 100, device="cuda"):
         super().__init__()
 
 
-        self.device = "cuda"
-        self.episode_len_buffer = torch.zeros(n_batch, device=self.device)
-        self.timestep = 0
-        self.batch = n_batch
-        self.reward = 0
+        self.device = device
+        self.num_envs = num_envs
+        self.max_episode_length = 1000
+
         self.target_base_height = 0.3
-        self.target_vx = 1.0
-        self.target_wz = 0.0
+        self.target_vx = 0.6
         self.action_scale = 0.25
-        self.dt = 0.002
+
+        self.num_obs = 45
+        self.num_actions = 12
+        self.cfg = {}
+
+        self.dt = 0.02
 
         self.scene = gs.Scene(show_viewer=render)
-        
         plane = self.scene.add_entity(gs.morphs.Plane())
         self.robot = self.scene.add_entity(
             gs.morphs.URDF(file='/home/yayy/My/Codeeeeee/Simulators/Genesis/genesis/assets/urdf/go2/urdf/go2.urdf'),
@@ -39,10 +41,10 @@ class WalkENV(gym.Env):
         )
 
         self._get_internal_info()
-        self.scene.build(n_envs = self.batch, env_spacing = (5.0, 5.0))
+        self.scene.build(n_envs = self.num_envs, env_spacing = (5.0, 5.0))
 
-        # self.robot.set_dofs_kp(torch.tensor([20] * 12),dofs_idx_local = self.joints_local_idx)
-        # self.robot.set_dofs_kv(torch.tensor([0.5] * 12),dofs_idx_local = self.joints_local_idx)
+        self.robot.set_dofs_kp(torch.tensor([20] * 12),dofs_idx_local = self.joints_local_idx)
+        self.robot.set_dofs_kv(torch.tensor([0.5] * 12),dofs_idx_local = self.joints_local_idx)
         
         self.observation_space = gym.spaces.Box(
             low=-np.inf,
@@ -60,14 +62,13 @@ class WalkENV(gym.Env):
 
         self.__initial_positions = torch.deg2rad(
             torch.tensor([
-                0, 0, 0, 0, 45, 45, 45, 45, -120, -120, -100, -100
+                0, 0, 0, 0, 45, 45, 57, 57, -85, -85, -85, -85
             ])
         )
 
-        self.action_t = torch.zeros((self.batch, 12))
-        self.action_t_1 = torch.zeros((self.batch, 12))
-        self.action_t_2 = torch.zeros((self.batch, 12))
-        self.previous_joint_velocity = torch.zeros((self.batch, 12))
+        self.actions = torch.zeros((self.num_envs, 12), device=self.device)
+        self.last_actions = torch.zeros_like(self.actions)
+        self.last_dof_vel = torch.zeros((self.num_envs, 12))
 
         joint_ranges = torch.deg2rad(
             torch.tensor([
@@ -88,11 +89,23 @@ class WalkENV(gym.Env):
                 (-130, -70)
             ])
         )
-
         self.dof_min = joint_ranges[:, 0]
         self.dof_max = joint_ranges[:, 1]
 
+
+        self.episode_length_buf = torch.zeros(self.num_envs, dtype=torch.int, device=self.device)
+        self.reset_buf = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
+
+
+        self.obs_buf = torch.zeros((self.num_envs, self.num_obs), device=self.device)
+        self.rew_buf = torch.zeros(self.num_envs, device=self.device)
+
+
         self.__get_linear_velocity()
+
+        # For rsl_rl library
+        self.extras = dict()
+        self.extras["observations"] = dict()
 
 
 
@@ -102,20 +115,15 @@ class WalkENV(gym.Env):
 
     def _get_internal_info(self):
         self.joints_local_idx = []
-        self.joints_limit_low = []
-        self.joints_limit_high = []
         for links in self.robot.links[1:]:
             joints = links.joints
             for joint in joints:
                 self.joints_local_idx.append(joint.dof_idx_local)
-                low, high = np.rad2deg(joint.dofs_limit)[0]
-                self.joints_limit_low.append(low.item())
-                self.joints_limit_high.append(high.item())
 
     def _get_imu_values(self):
-        _linear_acc, _angular_vel = self.imu.read()
+        _, _angular_vel = self.imu.read()
         """ The arrangement of angular_vel is roll pitch yaw"""
-        return torch.tensor(_angular_vel)
+        return _angular_vel
 
     def _get_ypr(self):
         quat_wxyz = self.robot.get_link("base").get_quat()
@@ -134,150 +142,170 @@ class WalkENV(gym.Env):
     
 
     def _calculate_reward(self):
-         
-        terminated = False
-        truncated = False
-        sigma = 0.2
+        base_pos = self.robot.get_link("base").get_pos()
+        base_vel = self.robot.get_link("base").get_vel()
+        base_ang_vel = self._get_imu_values()
+        dof_pos = self.robot.get_dofs_position(dofs_idx_local=self.joints_local_idx)
+        dof_vel = self.robot.get_dofs_velocity(dofs_idx_local=self.joints_local_idx)
 
-        linear_velocity = self.__get_linear_velocity()
-        angular_velocity = self._get_imu_values()
-        base_height = self.robot.get_link("base").get_pos()[:, 2]
-        current_joint_velocity = self.robot.get_dofs_velocity(dofs_idx_local = self.joints_local_idx)
-        torques = self.robot.get_dofs_control_force(dofs_idx_local = self.joints_local_idx)
-        projected_acceleration = self._calculate_projected_acceleration()
+        base_quat = self.robot.get_link("base").get_quat()
+        inv_base_quat = self._inv_quat(base_quat)
+        base_lin_vel_body = self._transform_by_quat(base_vel, inv_base_quat)
 
-        vx = linear_velocity[:, 0]
-        vy = linear_velocity[:, 1]
-        vz = linear_velocity[:, 2]
+        vx = base_lin_vel_body[:, 0]
+        vz = base_lin_vel_body[:, 2]
+        base_height = base_pos[:, 2]
 
-        reward_alive = 1.0
-        is_still = vx < 0.1
-        still_penalty = -is_still.float()
-        # linear_velocity_reward = -torch.square(vx - self.target_vx) + self.target_vx
-        linear_velocity_reward = torch.exp(-torch.square(vx - self.target_vx)/sigma)
-        reward_angular_velocity_yaw = torch.exp(-torch.square( angular_velocity[:, 2] - self.target_wz)/sigma)
-        linear_vel_z_axis_penalty = -torch.square(vz)
-        pitch_roll_penalty = -torch.sum(torch.square(angular_velocity[:, :2]), dim=1)
-        joint_acceleration_penalty = -torch.sum(torch.square((current_joint_velocity - self.previous_joint_velocity)/self.dt), dim=1)
-        action_smoothness_penalty = -torch.sum(torch.square(self.action_t - 2 * self.action_t_1 + self.action_t_2), dim=1)
-        height_penalty = -torch.square(self.target_base_height - base_height)
-        action_rate_penalty = -torch.sum(torch.square(self.action_t - self.action_t_1), dim=1)
-        orientation_penalty = -torch.sum(torch.square(projected_acceleration[:, :2]), dim=1)
-        torque_penalty = -torch.sum(torch.square(torques), dim =1)
+        lin_vel_error = torch.square(vx - self.target_vx)
+        lin_vel_z_penalty = torch.square(vz)
+        height_error = torch.square(base_height - self.target_base_height)
+        action_rate_penalty = torch.sum(torch.square(self.actions - self.last_actions), dim=1)
+        reward_similar_to_default = torch.sum(torch.abs(dof_pos - self.__initial_positions), dim=1)
+        # joint_vel_penalty = torch.sum(torch.square(dof_vel), dim=1)
+        # torques = self.robot.get_dofs_control_force(dofs_idx_local=self.joints_local_idx)
+        # torque_penalty = torch.sum(torch.square(torques), dim=1)
 
-        # print()
-        # print()
-        # print(linear_velocity_reward[0], linear_vel_z_axis_penalty[0], pitch_roll_penalty[0], joint_acceleration_penalty[0], action_smoothness_penalty[0],
-        #       action_rate_penalty[0], height_penalty[0], orientation_penalty[0], torque_penalty[0])
-        total_reward = (
-            linear_velocity_reward * 3 +
-            linear_vel_z_axis_penalty * 0.5 +
-            pitch_roll_penalty * 0.05 +
-            height_penalty * 2 +
-            joint_acceleration_penalty * 2.5e-8 +
-            torque_penalty * 0.0001 +
-            action_rate_penalty * 0.01 +
-            action_smoothness_penalty * 0.01 +
-            orientation_penalty * 0.2 +
-            reward_alive * 0.1  
-            # still_penalty * 5
+        reward_tracking = torch.exp(-lin_vel_error / 0.25)
+        reward = (
+            + 3.0 * reward_tracking
+            - 1.0 * lin_vel_z_penalty
+            - 50.0 * height_error
+            - 0.005 * action_rate_penalty
+            - 0.1 * reward_similar_to_default
         )
 
-        roll_pitch_yaw = self._get_ypr()
+        euler = self._quat_to_euler(base_quat)
+        terminated = (
+            (torch.abs(euler[:, 0]) > 0.35) |
+            (torch.abs(euler[:, 1]) > 0.35)
+        )
 
-        tilted_mask1 = abs(roll_pitch_yaw[:, 0]) > 1
-        tilted_mask2 =  abs(roll_pitch_yaw[:, 1]) > 1
-        tilted_mask = tilted_mask1 | tilted_mask2
-        low_base_height = base_height < 0.13
+        return reward, terminated
 
-        terminated = tilted_mask | low_base_height
-        total_reward[terminated] -= 7
-
-        return total_reward, terminated
     
+
+    def get_observations(self):
+        self.extras["observations"]["critic"] = self.obs_buf
+        return self.obs_buf, self.extras
+    
+    def get_privileged_observations(self):
+        return None
+
     def _get_obs(self):
         """
         https://arxiv.org/pdf/2406.04835v1
         I am using the obs space from here!!!
         """
+                
+        base_vel = self.robot.get_link("base").get_vel()
+        base_ang_vel = self._get_imu_values()
+        base_quat = self.robot.get_link("base").get_quat()
+        inv_base_quat = self._inv_quat(base_quat)
+        base_lin_vel_body = self._transform_by_quat(base_vel, inv_base_quat)
+        projected_gravity = self._calculate_projected_acceleration()
+        dof_pos = self.robot.get_dofs_position(dofs_idx_local=self.joints_local_idx) - self.__initial_positions
+        dof_vel = self.robot.get_dofs_velocity(dofs_idx_local=self.joints_local_idx)
 
-        linear_velocity = self.__get_linear_velocity()
-        angular_velocity = self._get_imu_values()
-        joint_positions = self.robot.get_dofs_position(dofs_idx_local = self.joints_local_idx) - self.__initial_positions
-        joint_velocities = self.robot.get_dofs_velocity(dofs_idx_local = self.joints_local_idx)
-        previous_action = self.action_t_1
-        projected_acceleration = self._calculate_projected_acceleration()
+        obs = torch.cat([
+            base_lin_vel_body * 2.0,                # 3
+            base_ang_vel * 0.25,                     # 3
+            projected_gravity,                       # 3
+            dof_pos,                                  # 12
+            dof_vel * 0.05,                           # 12
+            self.actions,                             # 12
+        ], dim=1)
+        return obs
 
-        return torch.cat([
-            linear_velocity * 2.0,    #3
-            angular_velocity  * 0.25, #3
-            projected_acceleration,   #3
-            joint_positions ,         #12
-            joint_velocities * 0.05,  #12
-            previous_action           #12
-        ], dim = 1)
-
-    def reset_env_idx(self, envs_ids):
-
-        if len(envs_ids) == 0:
+    def _reset_idx(self, envs_idx):
+        if len(envs_idx) == 0:
             return
+
+        self.robot.set_dofs_position(
+            self.__initial_positions.repeat(len(envs_idx), 1),
+            dofs_idx_local=self.joints_local_idx,
+            envs_idx=envs_idx
+        )
+        self.robot.set_dofs_velocity(
+            torch.zeros((len(envs_idx), 12), device=self.device),
+            dofs_idx_local=self.joints_local_idx,
+            envs_idx=envs_idx
+        )
+        base_quat = torch.tensor([1, 0, 0, 0], device=self.device).repeat(len(envs_idx), 1)
+        self.robot.set_quat(quat=base_quat, envs_idx=envs_idx)
+        base_pos = torch.tensor([0, 0, 0.42], device=self.device).repeat(len(envs_idx), 1)
+        self.robot.set_pos(base_pos, envs_idx=envs_idx)
+
+        self.episode_length_buf[envs_idx] = 0
+        self.actions[envs_idx] = 0
+        self.last_actions[envs_idx] = 0
+        self.last_dof_vel[envs_idx] = 0
         
-        initial_position = torch.tensor(self.__initial_positions).repeat(len(envs_ids), 1)
-        self.robot.set_dofs_position(initial_position,dofs_idx_local = self.joints_local_idx,envs_idx = envs_ids)
 
-        zeros = torch.zeros((len(envs_ids), 12), device=self.device)
-        self.robot.set_dofs_velocity(zeros, dofs_idx_local=self.joints_local_idx, envs_idx=envs_ids)
-
-        base_quat = torch.tensor([1, 0, 0, 0], device=self.device).repeat(len(envs_ids), 1)
-        self.robot.set_quat(quat=base_quat, envs_idx=envs_ids)
-
-        base_pos = torch.tensor([0, 0, 0.2], device=self.device).repeat(len(envs_ids), 1)
-        self.robot.set_pos(base_pos, envs_idx=envs_ids)
-
-        self.action_t_1[envs_ids] = 0
-        self.action_t_2[envs_ids] = 0
-        self.previous_joint_velocity[envs_ids] =0
-        self.episode_len_buffer[envs_ids] = 0
-        
-
-    def reset(self, *, seed=None, options=None):
-        super().reset()
-        # self.reset_env_idx(torchcl.arange(self.batch))
+    def reset(self):
+        super.
+        all_idx = torch.arange(self.num_envs, device=self.device)
+        self._reset_idx(all_idx)
         self.scene.reset()
-        observation = self._get_obs()
-        info = {}
-        self.scene.step()
-        return observation.detach().cpu().numpy(), info
+        self.obs_buf = self._get_obs()
+        return self.obs_buf, {} 
         
     def step(self, action):
         action = torch.tensor(action, dtype=torch.float)
         self.action_t = action.clone()
 
         target_dof_pos = self.__initial_positions + action * self.action_scale
-        # target_dof_pos = self.action_t_1 + action * self.action_scale
-        target_dof_pos = torch.clamp(target_dof_pos, self.dof_min, self.dof_max)
-
         self.robot.control_dofs_position(target_dof_pos, dofs_idx_local = self.joints_local_idx)
         self.scene.step()
        
         reward, terminated = self._calculate_reward()
 
-        self.episode_len_buffer += 1
-        truncated = self.episode_len_buffer > 2000
 
-        dones = torch.bitwise_or(terminated, truncated)
+        dones = terminated
 
-        self.action_t_2 = self.action_t_1.clone()
-        self.action_t_1 = self.action_t.clone()
+        final_obs = self._get_obs().clone()
+
+        self.last_actions = self.action_t.clone()
         self.previous_joint_velocity = self.robot.get_dofs_velocity(dofs_idx_local = self.joints_local_idx)
 
         reset_ids = torch.nonzero(dones).flatten()
         if len(reset_ids) > 0:
-            self.reset_env_idx(reset_ids)
+            self._reset_idx(reset_ids)
 
-        self.timestep += 1
         observation = self._get_obs()
-        return observation.detach().cpu().numpy(), reward.detach().cpu().numpy(), dones.detach().cpu().numpy(), {}
+        
+        info = {
+            "final_obs": final_obs.detach().cpu().numpy(),
+            "terminated": terminated.detach().cpu().numpy(),
+        }
+
+        self.extras["observations"]["critic"] = self.obs_buf
+
+    
+        return observation, reward, dones, self.extras
+    
+
+    def _inv_quat(self, q):
+        return torch.cat([q[..., :1], -q[..., 1:]], dim=-1)
+
+    def _transform_by_quat(self, v, q):
+        qvec = q[..., 1:]
+        uv = torch.cross(qvec, v, dim=-1)
+        uuv = torch.cross(qvec, uv, dim=-1)
+        return v + 2 * (q[..., :1] * uv + uuv)
+
+    def _quat_to_euler(self, q):
+        w, x, y, z = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
+        sinr_cosp = 2 * (w * x + y * z)
+        cosr_cosp = 1 - 2 * (x * x + y * y)
+        roll = torch.atan2(sinr_cosp, cosr_cosp)
+        sinp = 2 * (w * y - z * x)
+        pitch = torch.where(torch.abs(sinp) >= 1,
+                            torch.sign(sinp) * torch.pi / 2,
+                            torch.asin(sinp))
+        siny_cosp = 2 * (w * z + x * y)
+        cosy_cosp = 1 - 2 * (y * y + z * z)
+        yaw = torch.atan2(siny_cosp, cosy_cosp)
+        return torch.stack([roll, pitch, yaw], dim=-1)
     
 
 if __name__ == "__main__":
