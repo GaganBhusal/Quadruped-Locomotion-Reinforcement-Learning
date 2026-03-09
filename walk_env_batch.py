@@ -104,7 +104,7 @@ class WalkENV(gym.Env):
         self.__get_linear_velocity()
 
         # For rsl_rl library
-        self.extras = dict()
+        self.extras = dict()        
         self.extras["observations"] = dict()
 
 
@@ -242,7 +242,6 @@ class WalkENV(gym.Env):
         
 
     def reset(self):
-        super.
         all_idx = torch.arange(self.num_envs, device=self.device)
         self._reset_idx(all_idx)
         self.scene.reset()
