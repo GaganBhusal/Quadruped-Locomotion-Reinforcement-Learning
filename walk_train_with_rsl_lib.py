@@ -5,7 +5,7 @@ import torch
 import genesis as gs
 import rsl_rl
 from rsl_rl.runners import OnPolicyRunner
-from walk_env_batch import WalkENV
+from walk_env_batch_terrain import WalkENV
 
 def get_train_cfg(exp_name, max_iterations):
     return {
@@ -16,7 +16,7 @@ def get_train_cfg(exp_name, max_iterations):
             "entropy_coef": 0.01,
             "gamma": 0.99,
             "lam": 0.95,
-            "learning_rate": 0.001,
+            "learning_rate": 0.0005,
             "max_grad_norm": 1.0,
             "num_learning_epochs": 5,
             "num_mini_batches": 4,
@@ -53,21 +53,26 @@ def get_train_cfg(exp_name, max_iterations):
 def main():
     gs.init(backend=gs.gpu, logging_level="warning")
 
-    exp_name = "go2-walking-rsl"
-    num_envs = 4096
-    max_iterations = 1000 
+    exp_name = "go2_rsl"
+    num_envs = 128
+    max_iterations = 10000
 
     env = WalkENV(num_envs=num_envs, render=False, device=gs.device)
 
     log_dir = f"logs/{exp_name}"
-    if os.path.exists(log_dir):
-        shutil.rmtree(log_dir)
-    os.makedirs(log_dir, exist_ok=True)
+    # if os.path.exists(log_dir):
+    #     shutil.rmtree(log_dir)
+    # os.makedirs(log_dir, exist_ok=True)
 
     train_cfg = get_train_cfg(exp_name, max_iterations)
     pickle.dump(train_cfg, open(f"{log_dir}/cfgs.pkl", "wb"))
 
     runner = OnPolicyRunner(env, train_cfg, log_dir, device=gs.device)
+
+    resume_path = "logs/go2_rsl/model_2000.pt"
+    print(f"Loading model from: {resume_path}")
+    runner.load(resume_path)
+
     runner.learn(num_learning_iterations=max_iterations, init_at_random_ep_len=True)
 
 if __name__ == "__main__":
