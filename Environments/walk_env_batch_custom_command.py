@@ -5,6 +5,7 @@ import torch
 import numpy as np
 import gymnasium as gym
 from scipy.spatial.transform import Rotation
+from genesis.utils.geom import transform_by_quat, inv_quat
 import tensordict
 
 class WalkENV(gym.Env):
@@ -17,17 +18,16 @@ class WalkENV(gym.Env):
         self.num_envs = num_envs
         self.max_episode_length = 1000
 
-        self.target_base_height = 0.3
-        self.target_vx = 0.2
-        self.target_wz = 0.0
-        self.target_vy = 0.0
+        self.target_base_height = 0.32
+        self.target_vx = 1.0
+        self.target_wz = 1.0
         self.action_scale = 0.25
         self.time_step = 0
 
         self.sigma = 0.25
         
 
-        self.num_obs = 48
+        self.num_obs = 47
         self.num_actions = 12
         self.cfg = {}
 
@@ -68,7 +68,7 @@ class WalkENV(gym.Env):
         self.observation_space = gym.spaces.Box(
             low=-np.inf,
             high=np.inf,
-            shape=(48, ),
+            shape=(47, ),
             dtype=float
         )
 
@@ -81,7 +81,7 @@ class WalkENV(gym.Env):
 
         self.__initial_positions = torch.deg2rad(
             torch.tensor([
-                0, 0, 0, 0, 45, 45, 57, 57, -85, -85, -85, -85
+                0, 0, 0, 0, 46, 46, 57, 57, -86, -86, -86, -86
             ])
         )
 
@@ -121,12 +121,11 @@ class WalkENV(gym.Env):
 
 
         self.__get_linear_velocity()
-        self.custom_commands = torch.zeros((self.num_envs, 3), device=self.device)
+        self.custom_commands = torch.zeros((self.num_envs, 2), device=self.device)
         self.command_envs = torch.zeros(self.num_envs, device=self.device)
         self.sample_commands_interval = 20 
         self.custom_commands[:, 0] = 0.2
         self.custom_commands[:, 1] = 0.0
-        self.custom_commands[:, 2] = 0.0
         print(self.custom_commands)
 
         self.progress = False
@@ -135,22 +134,37 @@ class WalkENV(gym.Env):
         self.extras["observations"] = dict()
         self.extras["episode"] = dict()
 
+        self.feet_idx = [
+            self.robot.get_link("FL_calf").idx_local,
+            self.robot.get_link("FR_calf").idx_local,
+            self.robot.get_link("RL_calf").idx_local,
+            self.robot.get_link("RR_calf").idx_local,
+        ]
+        
+        self.feet_air_time = torch.zeros(self.num_envs, 4, device=self.device)
+
         self.episode_sums = {
             "reward_for_tracking_vx": torch.zeros(self.num_envs, dtype=torch.float, device=self.device),
-            "reward_for_tracking_vy": torch.zeros(self.num_envs, dtype=torch.float, device=self.device),
             "reward_for_tracking_wz": torch.zeros(self.num_envs, dtype=torch.float, device=self.device),
+            "height_penalty": torch.zeros(self.num_envs, dtype=torch.float, device=self.device),
+            # "penalty_for_tracking_vy": torch.zeros(self.num_envs, dtype=torch.float, device=self.device),
             "lin_vel_z_penalty": torch.zeros(self.num_envs, dtype=torch.float, device=self.device),
-            "height_error": torch.zeros(self.num_envs, dtype=torch.float, device=self.device),
+            # "ang_vel_penalty": torch.zeros(self.num_envs, dtype=torch.float, device=self.device),
             "action_rate_penalty": torch.zeros(self.num_envs, dtype=torch.float, device=self.device),
             "similar_to_default": torch.zeros(self.num_envs, dtype=torch.float, device=self.device),
             "torque_penalty": torch.zeros(self.num_envs, dtype=torch.float, device=self.device),
-            "Total Reward": torch.zeros(self.num_envs, dtype=torch.float, device=self.device),
+            "feet_air_time": torch.zeros(self.num_envs, dtype=torch.float, device=self.device),
+            # "Penalty_for_hip_drift": torch.zeros(self.num_envs, dtype=torch.float, device=self.device),
+            "Orientation_penalty": torch.zeros(self.num_envs, dtype=torch.float, device=self.device),
+            "Reward_Per_Environment": torch.zeros(self.num_envs, dtype=torch.float, device=self.device),
         }
 
 
 
     def __get_linear_velocity(self):
         vel_body = self.robot.get_link("base").get_vel()
+        base_quat = self.robot.get_link("base").get_quat()
+        vel_body = transform_by_quat(vel_body, inv_quat(base_quat))
         return torch.tensor(vel_body)
 
     def _get_internal_info(self):
@@ -158,7 +172,9 @@ class WalkENV(gym.Env):
         for links in self.robot.links[1:]:
             joints = links.joints
             for joint in joints:
+                print(f"Joint name: {joint.name}, local index: {joint.dof_idx_local}")
                 self.joints_local_idx.append(joint.dof_idx_local)
+
 
     def _get_imu_values(self):
         _, _angular_vel = self.imu.read()
@@ -198,10 +214,9 @@ class WalkENV(gym.Env):
         vz = base_lin_vel_body[:, 2]
         base_height = base_pos[:, 2]
 
-
         reward_for_tracking_vx = torch.exp(-torch.square(self.custom_commands[:, 0] - vx) / self.sigma)
-        reward_for_tracking_vy = torch.exp(-torch.square(self.custom_commands[:, 1] - vy) / self.sigma)
-        reward_for_tracking_wz = torch.exp(-torch.square(self.custom_commands[:, 2] - wz) / self.sigma)
+        reward_for_tracking_wz = torch.exp(-torch.square(self.custom_commands[:, 1] - wz) / self.sigma)
+        penalty_for_tracking_vy = torch.square(vy)
         lin_vel_error = torch.square(vx - self.target_vx)
         lin_vel_z_penalty = torch.square(vz)
         ang_vel_penalty = torch.sum(torch.square(base_ang_vel[:, :2]), dim=1)
@@ -209,53 +224,78 @@ class WalkENV(gym.Env):
         # penalty_angular_velocity_yaw = torch.exp(-torch.square(base_ang_vel[:, 2] - self.target_wz)/0.25)
         height_error = torch.square(base_height - self.target_base_height)
         action_rate_penalty = torch.sum(torch.square(self.actions - self.last_actions), dim=1)
-        reward_similar_to_default = torch.sum(torch.abs(dof_pos - self.__initial_positions), dim=1)
+        reward_similar_to_default = torch.sum(torch.square(dof_pos - self.__initial_positions), dim=1)
         joint_vel_penalty = torch.sum(torch.square(dof_vel), dim=1)
         torques = self.robot.get_dofs_control_force(dofs_idx_local=self.joints_local_idx)
         torque_penalty = torch.sum(torch.square(torques), dim=1)
         action_rate_penalty = torch.sum(torch.square(self.actions - self.last_actions), dim=1)
         reward_tracking = torch.exp(-lin_vel_error / 5)
 
-    
-        lazy_mask_vx = (torch.abs(self.custom_commands[:, 0]) > 0.1) & (vx * torch.sign(self.custom_commands[:, 0]) < (0.2 * torch.abs(self.custom_commands[:, 0])))
-        lazy_mask_vy = (torch.abs(self.custom_commands[:, 1]) > 0.1) & (vy * torch.sign(self.custom_commands[:, 1]) < (0.2 * torch.abs(self.custom_commands[:, 1])))
-        lazy_mask_wz = (torch.abs(self.custom_commands[:, 2]) > 0.1) & (wz * torch.sign(self.custom_commands[:, 2]) < (0.2 * torch.abs(self.custom_commands[:, 2])))
-        lazy_mask = lazy_mask_vx | lazy_mask_vy | lazy_mask_wz
+        projected_gravity = self._calculate_projected_acceleration()
+        orientation_penalty = torch.sum(torch.square(projected_gravity[:, :2]), dim=1)
 
+        hip_indices = [6, 7, 8, 9] 
+        hip_drift = dof_pos[:, hip_indices] - self.__initial_positions[hip_indices]
+        hip_drift_penalty = torch.sum(torch.square(hip_drift), dim=1)
+
+        # target_air_time = torch.clamp(self.custom_commands[:, 0] * 0.66,min = 0.15, max=0.33).unsqueeze(1)
+        # target_air_time = torch.clamp(self.custom_commands[:, 0] * 0.66, max=0.27).unsqueeze(1)
+        target_air_time = 0.5
+        contact_forces = self.robot.get_links_net_contact_force()
+        foot_forces_z = contact_forces[:, self.feet_idx, 2]
+
+        contact = foot_forces_z > 1.0
+        first_contact = (self.feet_air_time > 0.0) & contact
+        reward_feet_air_time = torch.sum(torch.square(torch.clamp(self.feet_air_time, max=0.28) - target_air_time) * first_contact, dim=1)
+        is_moving = (torch.norm(self.custom_commands, dim=1) > 0.1).float()
+        # reward_feet_air_time *= is_moving
+
+        self.feet_air_time += self.dt       
+        self.feet_air_time[contact] = 0.0
+
+        lazy_mask_vx = (torch.abs(self.custom_commands[:, 0]) > 0.1) & (vx * torch.sign(self.custom_commands[:, 0]) < (0.4 * torch.abs(self.custom_commands[:, 0])))
+        lazy_mask_wz = (torch.abs(self.custom_commands[:, 1]) > 0.1) & (wz * torch.sign(self.custom_commands[:, 1]) < (0.4 * torch.abs(self.custom_commands[:, 1])))
         
         reward = (
-            + 3.0 * reward_for_tracking_vx
-            + 3.0 * reward_for_tracking_vy
-            + 3.0 * reward_for_tracking_wz
+            + 1 * reward_for_tracking_vx
+            + 0.5 * reward_for_tracking_wz
+            # -2.0 * penalty_for_tracking_vy
+            + 1.0 * reward_feet_air_time
             # + 3.0 * reward_tracking
-            # - 1.0 * ang_vel_penalty
-            - 1.0 * lin_vel_z_penalty
-            - 50.0 * height_error
-            - 0.005 * action_rate_penalty
-            - 0.1 * reward_similar_to_default
+            # - 0.05 * ang_vel_penalty
+            - 2.0 * lin_vel_z_penalty
+            # - 5.0 * height_error
+            - 0.01 * action_rate_penalty
+            - 0.2 * reward_similar_to_default
             - 1e-5 * torque_penalty
+            - 5.0 * orientation_penalty
             # -0.001 * joint_vel_penalty
+            # -2.0 * hip_drift_penalty
         )
         
-        self.episode_sums["reward_for_tracking_vx"] += reward_for_tracking_vx * 3.0
-        self.episode_sums["reward_for_tracking_vy"] += reward_for_tracking_vy * 3.0
-        self.episode_sums["reward_for_tracking_wz"] += reward_for_tracking_wz * 3.0
-        self.episode_sums["lin_vel_z_penalty"] += lin_vel_z_penalty * -1.0
-        self.episode_sums["height_error"] += height_error * -50.0
-        self.episode_sums["action_rate_penalty"] += action_rate_penalty * -0.005
+        self.episode_sums["reward_for_tracking_vx"] += reward_for_tracking_vx * 1.0
+        self.episode_sums["reward_for_tracking_wz"] += reward_for_tracking_wz * 0.5
+        self.episode_sums["height_penalty"] += height_error * -5.0
+        # self.episode_sums["penalty_for_tracking_vy"] += penalty_for_tracking_vy * -2.0
+        self.episode_sums["lin_vel_z_penalty"] += lin_vel_z_penalty * -2.0
+        # self.episode_sums["ang_vel_penalty"] += ang_vel_penalty * -0.05
+        self.episode_sums["action_rate_penalty"] += action_rate_penalty * -0.01
         self.episode_sums["similar_to_default"] += reward_similar_to_default * -0.1
         self.episode_sums["torque_penalty"] += torque_penalty * -1e-5
-
-        reward[lazy_mask] -= 3
-        self.episode_sums["Total Reward"] += reward
+        self.episode_sums["feet_air_time"] += reward_feet_air_time * 1.0
+        # self.episode_sums["Penalty_for_hip_drift"] += hip_drift_penalty * -2.0
+        self.episode_sums["Orientation_penalty"] += orientation_penalty * -5.0
+        self.episode_sums["Reward_Per_Environment"] += reward
 
         euler = self._quat_to_euler(base_quat)
         terminated = (
             (torch.abs(euler[:, 0]) > 0.35) |
-            (torch.abs(euler[:, 1]) > 0.35)
+            (torch.abs(euler[:, 1]) > 0.35) |
+            (base_height < 0.15)
         )
 
-        # reward[terminated] -= 5
+        reward[terminated] -= 200
+        reward *= self.dt
 
         return reward, terminated
 
@@ -279,6 +319,12 @@ class WalkENV(gym.Env):
         projected_gravity = self._calculate_projected_acceleration()
         dof_pos = self.robot.get_dofs_position(dofs_idx_local=self.joints_local_idx) - self.__initial_positions
         dof_vel = self.robot.get_dofs_velocity(dofs_idx_local=self.joints_local_idx)
+        
+        scaled_commands = torch.stack([
+            self.custom_commands[:, 0] * 2.0,   
+            self.custom_commands[:, 1] * 0.25   
+        ], dim=1)
+
         obs = torch.cat([
             base_lin_vel_body * 2.0,                # 3
             base_ang_vel * 0.25,                     # 3
@@ -286,7 +332,7 @@ class WalkENV(gym.Env):
             dof_pos,                                  # 12
             dof_vel * 0.05,                           # 12
             self.actions,                             # 12
-            self.custom_commands                            # 3
+            scaled_commands                            # 2
         ], dim=1)
         return obs
 
@@ -298,7 +344,7 @@ class WalkENV(gym.Env):
         self.extras["episode"] = {}
         for key, value in self.episode_sums.items():
             avg_reward = torch.mean(value[envs_idx]) / self.max_episode_length
-            self.extras["episode"][key] = avg_reward
+            self.extras["episode"]["rew_" + key] = avg_reward
             
             value[envs_idx] = 0.0
 
@@ -312,6 +358,8 @@ class WalkENV(gym.Env):
             dofs_idx_local=self.joints_local_idx,
             envs_idx=envs_idx
         )
+
+        self.update_commands(envs_idx)
         base_quat = torch.tensor([1, 0, 0, 0], device=self.device).repeat(len(envs_idx), 1)
         self.robot.set_quat(quat=base_quat, envs_idx=envs_idx)
         base_pos = torch.tensor([0, 0, 0.42], device=self.device).repeat(len(envs_idx), 1)
@@ -330,39 +378,31 @@ class WalkENV(gym.Env):
         self.obs_buf = self._get_obs()
         return self.obs_buf, {} 
 
-    def update_commands(self, env_ids):
-        sample_mask = (self.command_envs[env_ids] >= self.sample_commands_interval)
-        if sample_mask.any():
-            idx = env_ids[sample_mask]
-            self.custom_commands[idx, 0] = torch.rand(len(idx), device=self.device) * 2.0 * self.target_vx - self.target_vx
-            self.custom_commands[idx, 1] = torch.rand(len(idx), device=self.device) * 2.0 * self.target_vy - self.target_vy
-            self.custom_commands[idx, 2] = torch.rand(len(idx), device=self.device) * 2.0 * self.target_wz - self.target_wz
-
-            self.custom_commands[idx[torch.rand(len(idx), device=self.device) < 0.15]] = 0.0
-
-            self.command_envs[idx] = 0
+    def update_commands(self, idx):
+    
+        self.custom_commands[idx, 0] = torch.rand(len(idx), device=self.device) * 2.0 * self.target_vx - self.target_vx
+        self.custom_commands[idx, 1] = torch.rand(len(idx), device=self.device) * 2.0 * self.target_wz - self.target_wz
+        self.custom_commands[idx[torch.rand(len(idx), device=self.device) < 0.15]] = 0.0
+        self.command_envs[idx] = 0
 
     def step(self, action):
         # self.sigma -= 0.25 / (4096 * 10)
         # self.sigma = max(self.sigma, 0.001)
         # self.target_vx += 0.6/(self.num_envs * 100)
         # self.target_vx = min(self.target_vx, 5.0)
-        self.time_step += 4/(self.num_envs)
-        if self.time_step >= 10.0:
-            self.start_progress = True
+        # self.time_step += 4/(self.num_envs)
+        # if self.time_step >= 10.0:
+        #     self.start_progress = True
 
-        if self.progress:
-            self.target_vx += 0.2/(self.num_envs * 4)
-            self.target_vx = min(self.target_vx, 1.0)
+        # if self.progress:
+        #     self.target_vx += 0.2/(self.num_envs * 4)
+        #     self.target_vx = min(self.target_vx, 1.0)
 
-            self.target_wz += 0.2/(self.num_envs * 4)
-            self.target_wz = min(self.target_wz, 1.0)
+        #     self.target_wz += 0.2/(self.num_envs * 4)
+        #     self.target_wz = min(self.target_wz, 1.0)
 
-            self.target_vy += 0.2/(self.num_envs * 4)
-            self.target_vy = min(self.target_vy, 1.0)
-
-            self.sigma -= 0.2 / (self.num_envs * 20)
-            self.sigma = max(self.sigma, 0.001)
+        #     self.sigma -= 0.2 / (self.num_envs * 20)
+        #     self.sigma = max(self.sigma, 0.001)
         self.actions = action.clone()
 
         target_dof_pos = self.__initial_positions + action * self.action_scale
@@ -370,7 +410,6 @@ class WalkENV(gym.Env):
         self.scene.step()
         self.command_envs += 1
     
-        self.update_commands(torch.arange(self.num_envs, device=self.device))
         reward, terminated = self._calculate_reward()
 
         self.episode_length_buf += 1
