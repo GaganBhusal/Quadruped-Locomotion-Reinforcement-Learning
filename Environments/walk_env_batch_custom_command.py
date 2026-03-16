@@ -28,6 +28,8 @@ class WalkENV(gym.Env):
         
 
         self.num_obs = 47
+        self.obs_history_length = 5
+        self.total_obs_len = self.num_obs * self.obs_history_length
         self.num_actions = 12
         self.cfg = {}
 
@@ -68,9 +70,11 @@ class WalkENV(gym.Env):
         self.observation_space = gym.spaces.Box(
             low=-np.inf,
             high=np.inf,
-            shape=(47, ),
+            shape=(self.total_obs_len, ),
             dtype=float
         )
+
+        self.obs_histoy = torch.zeros((self.num_envs, self.obs_history_length), device = self.device)
 
         self.action_space = gym.spaces.Box(
             low=-1,
@@ -325,7 +329,7 @@ class WalkENV(gym.Env):
             self.custom_commands[:, 1] * 0.25   
         ], dim=1)
 
-        obs = torch.cat([
+        current_obs = torch.cat([
             base_lin_vel_body * 2.0,                # 3
             base_ang_vel * 0.25,                     # 3
             projected_gravity,                       # 3
@@ -334,7 +338,11 @@ class WalkENV(gym.Env):
             self.actions,                             # 12
             scaled_commands                            # 2
         ], dim=1)
-        return obs
+
+        # Add history of observations
+        self.obs_histoy[:, :-self.num_obs] = self.obs_histoy[:, self.num_obs:]
+        self.obs_histoy[:, -self.num_obs:] = current_obs
+        return self.obs_histoy
 
     def _reset_idx(self, envs_idx):
         
@@ -359,16 +367,18 @@ class WalkENV(gym.Env):
             envs_idx=envs_idx
         )
 
-        self.update_commands(envs_idx)
+        self.episode_length_buf[envs_idx] = 0
+        self.actions[envs_idx] = 0
+        self.last_actions[envs_idx] = 0
+        self.last_dof_vel[envs_idx] = 0
+        self.obs_histoy[envs_idx] = 0
+
         base_quat = torch.tensor([1, 0, 0, 0], device=self.device).repeat(len(envs_idx), 1)
         self.robot.set_quat(quat=base_quat, envs_idx=envs_idx)
         base_pos = torch.tensor([0, 0, 0.42], device=self.device).repeat(len(envs_idx), 1)
         self.robot.set_pos(base_pos, envs_idx=envs_idx)
 
-        self.episode_length_buf[envs_idx] = 0
-        self.actions[envs_idx] = 0
-        self.last_actions[envs_idx] = 0
-        self.last_dof_vel[envs_idx] = 0
+        self.update_commands(envs_idx)
         
 
     def reset(self):
