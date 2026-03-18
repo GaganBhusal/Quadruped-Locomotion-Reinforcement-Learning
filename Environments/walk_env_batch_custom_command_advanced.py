@@ -7,16 +7,18 @@ import gymnasium as gym
 from scipy.spatial.transform import Rotation
 from genesis.utils.geom import transform_by_quat, inv_quat
 import tensordict
+import random
+from Environments.domain_randomization import DomainRandomization
 
 class WalkENV(gym.Env):
 
-    def __init__(self, render = True, backend = gs.gpu, num_envs = 100, device="cuda", kwargs = {}):
+    def __init__(self, render = True, backend = gs.gpu, num_envs = 100, device="cuda", t_x = 20, t_y = 50, number_of_lanes=1, number_of_rows=10):
         super().__init__()
 
 
         self.device = device
         self.num_envs = num_envs
-        self.max_episode_length = 1000
+        self.max_episode_length = 100000
 
 
         # Basic Parameters
@@ -31,7 +33,16 @@ class WalkENV(gym.Env):
         self.global_gravity = torch.tensor([0.0, 0.0, -1.0], device=gs.device)
         self.episode_length_buf = torch.zeros(self.num_envs, dtype=torch.int, device=self.device)
         self.reward_survival = 20
-        
+
+
+        # Terrain Setup
+        terrain_x, self.terrain_y = t_x, t_y
+        self.start_x, self.start_y, self.start_z = 2, 2, 0.42
+        self.num_lanes = number_of_lanes
+        self.num_of_rows = number_of_rows
+        self.env_seperation = (0, (self.terrain_y * self.num_lanes-5)/self.num_envs)
+        self.terrain_length = number_of_rows * t_x
+        self.terrain_breadth = self.num_lanes * t_y
         
         # Setting Up Scene and sensors
         self.scene = gs.Scene(sim_options=gs.options.SimOptions(
@@ -44,7 +55,7 @@ class WalkENV(gym.Env):
                 max_collision_pairs=20,
             ),
             show_viewer=render)
-        plane = self.scene.add_entity(gs.morphs.Plane())
+        # plane = self.scene.add_entity(gs.morphs.Plane())
         self.robot = self.scene.add_entity(
             gs.morphs.URDF(file='/home/yayy/My/Codeeeeee/Simulators/Genesis/genesis/assets/urdf/go2/urdf/go2.urdf'),
         )
@@ -57,11 +68,37 @@ class WalkENV(gym.Env):
                 draw_debug = True
             )
         )
+
+        curriculum_terrains = [
+            "flat_terrain",
+            "wave_terrain",
+            "pyramid_sloped_terrain",
+            "pyramid_stairs_terrain",
+            "discrete_obstacles_terrain",
+            "random_uniform_terrain",
+        ]
+        print(curriculum_terrains)
+        print()
+        curriculum_terrains = [[random.choice(curriculum_terrains) for _ in range(self.num_lanes)] for i in range(self.num_of_rows)]
+
+        self.scene.add_entity(
+            morph=gs.morphs.Terrain(
+                n_subterrains=(self.num_of_rows, self.num_lanes),
+                subterrain_size=(terrain_x, self.terrain_y),      
+                horizontal_scale=0.1,            
+                vertical_scale=0.005,            
+                subterrain_types=curriculum_terrains,
+                randomize=False,
+                name="my_dog_curriculum"
+            ),
+        )
+
         self.scene.build(n_envs = self.num_envs, env_spacing = (5.0, 5.0))
 
         self._get_internal_info()
         self.robot.set_dofs_kp(torch.tensor([40] * 12),dofs_idx_local = self.joints_local_idx)
         self.robot.set_dofs_kv(torch.tensor([1] * 12),dofs_idx_local = self.joints_local_idx)
+        self.domainrandomizer = DomainRandomization(self.robot, self.num_envs, self.joints_local_idx)
 
         # Observations and actions
         self.num_obs = 47
@@ -213,6 +250,8 @@ class WalkENV(gym.Env):
         vy = base_lin_vel_body[:, 1]
         wz = base_ang_vel[:, 2]
         vz = base_lin_vel_body[:, 2]
+        base_x_pos = base_pos[:, 0]
+        base_y_pos = base_pos[:, 1]
         base_height = base_pos[:, 2]
         current_pitch = self._get_ypr()[:, 1]
 
@@ -338,7 +377,9 @@ class WalkENV(gym.Env):
 
         euler = self._quat_to_euler(base_quat)
         terminated = ((torch.abs(euler[:, 0]) > 0.5) | (torch.abs(euler[:, 1]) > 0.5) | (base_height < 0.05))
+        out_of_trajectory = (base_x_pos < 0.5) | (base_x_pos > self.terrain_length-0.5) | (base_y_pos < 0.5) | (base_y_pos > self.terrain_breadth - 0.5)
         reward[terminated] -= 500
+
         
         self.episode_sums["reward_for_tracking_vx"] += reward_for_tracking_vx
         self.episode_sums["reward_for_tracking_wz"] += reward_for_tracking_wz
@@ -362,7 +403,7 @@ class WalkENV(gym.Env):
         self.episode_sums["Reward_Per_Environment"] += reward * 1.0
         reward *= self.dt
 
-        return reward, terminated
+        return reward, terminated, out_of_trajectory
 
     def get_observations(self):
         self.extras["observations"]["critic"] = self.obs_buf
@@ -441,10 +482,24 @@ class WalkENV(gym.Env):
         self.last_dof_vel[envs_idx] = 0
         self.obs_histoy[envs_idx] = 0
 
-        base_quat = torch.tensor([1, 0, 0, 0], device=self.device).repeat(len(envs_idx), 1)
+        x = torch.randint(low=10, high=self.terrain_length-10, size=(len(envs_idx), ))
+        # y = torch.randint(low=20, high=self.terrain_breadth-20, size=(len(envs_idx), ))
+        z = torch.ones_like(x) * 0.4
+        x = 2
+        y = 2
+        z = 0.4
+        
+        # a = torch.ones_like(x)
+        # b = torch.zeros_like(a)
+        # c = torch.zeros_like(a)
+        # d = torch.zeros_like(a)
+
+        base_quat = torch.tensor([1, 0, 0, 0], device=self.device)
         self.robot.set_quat(quat=base_quat, envs_idx=envs_idx)
-        base_pos = torch.tensor([0, 0, 0.3], device=self.device).repeat(len(envs_idx), 1)
+        base_pos = torch.tensor([x, y, z], device=self.device)
+        # base_pos = torch.stack([x, y, z], dim=1)
         self.robot.set_pos(base_pos, envs_idx=envs_idx)
+        self.domainrandomizer.randomize(envs_idx)
 
         self.update_commands(envs_idx)
         
@@ -472,12 +527,12 @@ class WalkENV(gym.Env):
         self.scene.step()
         self.command_envs += 1
     
-        reward, terminated = self._calculate_reward()
+        reward, terminated, out_of_trajectory = self._calculate_reward()
 
         self.episode_length_buf += 1
         time_out = self.episode_length_buf >= self.max_episode_length
         self.extras["time_outs"] = time_out
-        dones = terminated | time_out
+        dones = terminated | time_out | out_of_trajectory
 
         final_obs = self._get_obs().clone()
         
