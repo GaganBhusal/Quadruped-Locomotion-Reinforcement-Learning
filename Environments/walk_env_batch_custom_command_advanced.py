@@ -6,9 +6,9 @@ import numpy as np
 import gymnasium as gym
 from scipy.spatial.transform import Rotation
 from genesis.utils.geom import transform_by_quat, inv_quat
-import tensordict
 import random
 from Environments.domain_randomization import DomainRandomization
+from Environments.camera_adjustment_sliders import Sliders
 
 class WalkENV(gym.Env):
 
@@ -68,6 +68,43 @@ class WalkENV(gym.Env):
                 draw_debug = True
             )
         )
+
+        # Adding Camera
+        self.cam_forward = self.scene.add_camera(
+            res=(640, 480),
+            pos=(0, 0.0, 0),
+            lookat=(10, 0, 0),
+            fov=100,
+            GUI=True,
+        )
+
+        offset_T_forward = np.eye(4)
+        offset_T_forward[0, 3] = 1
+        offset_T_forward[1, 3] = 0.0
+        offset_T_forward[2, 3] = 0.5
+        r = Rotation.from_euler('z', -90, degrees=True)
+        offset_T_forward[:3, :3] = r.as_matrix()
+        self.cam_forward.attach(rigid_link=self.robot.get_link("base"), offset_T=offset_T_forward)
+        self.cam_sliders_forward = Sliders()
+
+        self.cam_foot = self.scene.add_camera(
+            res=(640, 480),
+            pos=(0, 0.0, 0),
+            lookat=(10, 0, 0),
+            fov=100,
+            GUI=True,
+        )
+
+        offset_T_foot = np.eye(4)
+        offset_T_foot[0, 3] = 1
+        offset_T_foot[1, 3] = 0.0
+        offset_T_foot[2, 3] = 0.5
+        r = Rotation.from_euler('z', -90, degrees=True)
+        offset_T_foot[:3, :3] = r.as_matrix()
+        self.cam_foot.attach(rigid_link=self.robot.get_link("base"), offset_T=offset_T_foot)
+        self.cam_sliders_foot = Sliders()
+
+
 
         curriculum_terrains = [
             "flat_terrain",
@@ -503,6 +540,19 @@ class WalkENV(gym.Env):
 
         self.update_commands(envs_idx)
         
+    def update_cam(self):
+        offset_T_forward = self.cam_sliders_forward.update_values()
+        offset_T_foot = self.cam_sliders_foot.update_values()
+
+
+        base_link = self.robot.get_link("base")
+        self.cam_forward.attach(base_link, offset_T_forward)
+        self.cam_foot.attach(base_link, offset_T_foot)
+        self.cam_forward.move_to_attach()
+        self.cam_foot.move_to_attach()
+
+        depth_img, seg, col_seg, normal = self.cam_forward.render(rgb=True, depth=False, segmentation=False, colorize_seg=False, normal=True) 
+        depth_img2, seg2, col_seg2, normal2 = self.cam_foot.render(rgb=True, depth=False, segmentation=False, colorize_seg=False, normal=True) 
 
     def reset(self):
         all_idx = torch.arange(self.num_envs, device=self.device)
@@ -552,7 +602,7 @@ class WalkENV(gym.Env):
             "terminated": terminated.detach().cpu().numpy(),
         }
 
-        self.extras["observations"]["critic"] = observation
+        self.update_cam()
     
         return observation, reward, dones, self.extras
     
