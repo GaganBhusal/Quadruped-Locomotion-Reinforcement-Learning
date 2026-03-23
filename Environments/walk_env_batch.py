@@ -1,3 +1,5 @@
+import math
+
 import genesis as gs
 import torch
 import numpy as np
@@ -7,7 +9,7 @@ import tensordict
 
 class WalkENV(gym.Env):
 
-    def __init__(self, render = True, backend = gs.gpu, num_envs = 100, device="cuda"):
+    def __init__(self, render = True, backend = gs.gpu, num_envs = 100, device="cuda", kwargs = {}):
         super().__init__()
 
 
@@ -17,7 +19,10 @@ class WalkENV(gym.Env):
 
         self.target_base_height = 0.3
         self.target_vx = 0.6
+        self.target_wz = 0.0
         self.action_scale = 0.25
+        self.time_step = 0
+        
 
         self.num_obs = 45
         self.num_actions = 12
@@ -25,7 +30,16 @@ class WalkENV(gym.Env):
 
         self.dt = 0.02
 
-        self.scene = gs.Scene(show_viewer=render)
+        self.scene = gs.Scene(sim_options=gs.options.SimOptions(
+                dt=self.dt,
+                substeps=1,
+            ),
+            rigid_options=gs.options.RigidOptions(
+                enable_self_collision=False,
+                tolerance=1e-5,
+                max_collision_pairs=20,
+            ),
+            show_viewer=render)
         plane = self.scene.add_entity(gs.morphs.Plane())
         self.robot = self.scene.add_entity(
             gs.morphs.URDF(file='/home/yayy/My/Codeeeeee/Simulators/Genesis/genesis/assets/urdf/go2/urdf/go2.urdf'),
@@ -40,11 +54,13 @@ class WalkENV(gym.Env):
             )
         )
 
+        self.global_gravity = torch.tensor([0.0, 0.0, -1.0], device=gs.device)
+
         self._get_internal_info()
         self.scene.build(n_envs = self.num_envs, env_spacing = (5.0, 5.0))
 
-        self.robot.set_dofs_kp(torch.tensor([20] * 12),dofs_idx_local = self.joints_local_idx)
-        self.robot.set_dofs_kv(torch.tensor([0.5] * 12),dofs_idx_local = self.joints_local_idx)
+        self.robot.set_dofs_kp(torch.tensor([40] * 12),dofs_idx_local = self.joints_local_idx)
+        self.robot.set_dofs_kv(torch.tensor([1] * 12),dofs_idx_local = self.joints_local_idx)
         
         self.observation_space = gym.spaces.Box(
             low=-np.inf,
@@ -121,7 +137,7 @@ class WalkENV(gym.Env):
                 self.joints_local_idx.append(joint.dof_idx_local)
 
     def _get_imu_values(self):
-        _, _angular_vel = self.imu.read()
+        _angular_vel = self.imu.read()[:, 1]
         """ The arrangement of angular_vel is roll pitch yaw"""
         return _angular_vel
 
@@ -149,8 +165,7 @@ class WalkENV(gym.Env):
         dof_vel = self.robot.get_dofs_velocity(dofs_idx_local=self.joints_local_idx)
 
         base_quat = self.robot.get_link("base").get_quat()
-        inv_base_quat = self._inv_quat(base_quat)
-        base_lin_vel_body = self._transform_by_quat(base_vel, inv_base_quat)
+        base_lin_vel_body = self.__get_linear_velocity()
 
         vx = base_lin_vel_body[:, 0]
         vz = base_lin_vel_body[:, 2]
@@ -158,27 +173,36 @@ class WalkENV(gym.Env):
 
         lin_vel_error = torch.square(vx - self.target_vx)
         lin_vel_z_penalty = torch.square(vz)
+        ang_vel_penalty = torch.sum(torch.square(base_ang_vel), dim=1)
+        # penalty_angular_velocity_pit = torch.exp(-torch.square(base_ang_vel[:, 2] - self.target_wz)/0.25)
+        # penalty_angular_velocity_yaw = torch.exp(-torch.square(base_ang_vel[:, 2] - self.target_wz)/0.25)
         height_error = torch.square(base_height - self.target_base_height)
         action_rate_penalty = torch.sum(torch.square(self.actions - self.last_actions), dim=1)
         reward_similar_to_default = torch.sum(torch.abs(dof_pos - self.__initial_positions), dim=1)
-        # joint_vel_penalty = torch.sum(torch.square(dof_vel), dim=1)
-        # torques = self.robot.get_dofs_control_force(dofs_idx_local=self.joints_local_idx)
-        # torque_penalty = torch.sum(torch.square(torques), dim=1)
+        joint_vel_penalty = torch.sum(torch.square(dof_vel), dim=1)
+        torques = self.robot.get_dofs_control_force(dofs_idx_local=self.joints_local_idx)
+        torque_penalty = torch.sum(torch.square(torques), dim=1)
+        action_rate_penalty = torch.sum(torch.square(self.actions - self.last_actions), dim=1)
+        reward_tracking = torch.exp(-lin_vel_error / 5)
 
-        reward_tracking = torch.exp(-lin_vel_error / 0.25)
         reward = (
             + 3.0 * reward_tracking
+            - 1.0 * ang_vel_penalty
             - 1.0 * lin_vel_z_penalty
             - 50.0 * height_error
             - 0.005 * action_rate_penalty
             - 0.1 * reward_similar_to_default
+            # - 1e-5 * torque_penalty
+            # -0.001 * joint_vel_penalty
         )
 
         euler = self._quat_to_euler(base_quat)
         terminated = (
-            (torch.abs(euler[:, 0]) > 0.35) |
-            (torch.abs(euler[:, 1]) > 0.35)
+            (torch.abs(euler[:, 0]) > 0.4) |
+            (torch.abs(euler[:, 1]) > 0.4)
         )
+
+        reward[terminated] -= 5
 
         return reward, terminated
 
@@ -200,8 +224,7 @@ class WalkENV(gym.Env):
         base_vel = self.robot.get_link("base").get_vel()
         base_ang_vel = self._get_imu_values()
         base_quat = self.robot.get_link("base").get_quat()
-        inv_base_quat = self._inv_quat(base_quat)
-        base_lin_vel_body = self._transform_by_quat(base_vel, inv_base_quat)
+        base_lin_vel_body = self.__get_linear_velocity()
         projected_gravity = self._calculate_projected_acceleration()
         dof_pos = self.robot.get_dofs_position(dofs_idx_local=self.joints_local_idx) - self.__initial_positions
         dof_vel = self.robot.get_dofs_velocity(dofs_idx_local=self.joints_local_idx)
@@ -249,8 +272,9 @@ class WalkENV(gym.Env):
         return self.obs_buf, {} 
         
     def step(self, action):
-        action = torch.tensor(action, dtype=torch.float)
-        self.action_t = action.clone()
+        self.target_vx += 0.6/(self.num_envs * 100)
+        self.target_vx = min(self.target_vx, 5.0)
+        self.actions = action.clone()
 
         target_dof_pos = self.__initial_positions + action * self.action_scale
         self.robot.control_dofs_position(target_dof_pos, dofs_idx_local = self.joints_local_idx)
@@ -258,12 +282,14 @@ class WalkENV(gym.Env):
        
         reward, terminated = self._calculate_reward()
 
-
-        dones = terminated
+        self.episode_length_buf += 1
+        time_out = self.episode_length_buf >= self.max_episode_length
+        self.extras["time_outs"] = time_out
+        dones = terminated | time_out
 
         final_obs = self._get_obs().clone()
 
-        self.last_actions = self.action_t.clone()
+        self.last_actions = self.actions.clone()
         self.previous_joint_velocity = self.robot.get_dofs_velocity(dofs_idx_local = self.joints_local_idx)
 
         reset_ids = torch.nonzero(dones).flatten()
@@ -277,20 +303,10 @@ class WalkENV(gym.Env):
             "terminated": terminated.detach().cpu().numpy(),
         }
 
-        self.extras["observations"]["critic"] = self.obs_buf
-
+        self.extras["observations"]["critic"] = observation
     
         return observation, reward, dones, self.extras
     
-
-    def _inv_quat(self, q):
-        return torch.cat([q[..., :1], -q[..., 1:]], dim=-1)
-
-    def _transform_by_quat(self, v, q):
-        qvec = q[..., 1:]
-        uv = torch.cross(qvec, v, dim=-1)
-        uuv = torch.cross(qvec, uv, dim=-1)
-        return v + 2 * (q[..., :1] * uv + uuv)
 
     def _quat_to_euler(self, q):
         w, x, y, z = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
