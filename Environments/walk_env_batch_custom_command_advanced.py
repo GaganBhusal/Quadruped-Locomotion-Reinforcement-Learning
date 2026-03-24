@@ -559,7 +559,9 @@ class WalkENV(gym.Env):
         self._reset_idx(all_idx)
         self.scene.reset()
         self.obs_buf = self._get_obs()
-        return self.obs_buf, {} 
+        return self.obs_buf, {
+            "camera" : self.cam_forward.render()
+        } 
 
     def update_commands(self, idx):
     
@@ -603,6 +605,7 @@ class WalkENV(gym.Env):
         }
 
         self.update_cam()
+        self.extras["camera"] = self.cam_forward.render()
     
         return observation, reward, dones, self.extras
     
